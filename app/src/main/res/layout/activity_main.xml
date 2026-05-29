@@ -31,6 +31,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content">
 
+            <!-- 核心修复：添加了 android:textIsSelectable="true" 属性 -->
             <TextView
                 android:id="@+id/tv_code"
                 android:layout_width="wrap_content"
@@ -39,7 +40,8 @@
                 android:fontFamily="monospace"
                 android:text="源码将在此处显示..."
                 android:textColor="@android:color/black"
-                android:textSize="12sp" />
+                android:textSize="12sp"
+                android:textIsSelectable="true" /> 
         </HorizontalScrollView>
     </ScrollView>
 </LinearLayout>
