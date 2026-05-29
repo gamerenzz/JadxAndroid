@@ -11,7 +11,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Button
-import android.widget.CheckBox // 引入 CheckBox
+import android.widget.CheckBox 
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts 
@@ -33,7 +33,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var btnSelectFile: Button
     private lateinit var btnSaveTxt: Button
-    private lateinit var cbFilterSdk: CheckBox // 声明 CheckBox
+    private lateinit var cbFilterSdk: CheckBox 
     private lateinit var tvStatus: TextView
     private lateinit var tvCode: TextView
 
@@ -56,7 +56,7 @@ class MainActivity : AppCompatActivity() {
 
         btnSelectFile = findViewById(R.id.btn_select_file)
         btnSaveTxt = findViewById(R.id.btn_save_txt)
-        cbFilterSdk = findViewById(R.id.cb_filter_sdk) // 绑定 CheckBox
+        cbFilterSdk = findViewById(R.id.cb_filter_sdk) 
         tvStatus = findViewById(R.id.tv_status)
         tvCode = findViewById(R.id.tv_code)
 
@@ -88,7 +88,6 @@ class MainActivity : AppCompatActivity() {
             if (tempFile != null && tempFile.exists()) {
                 currentPreparedFile = tempFile
                 tvStatus.text = "状态: 正在反编译中，请稍候..."
-                // 传入是否开启过滤的参数
                 val decompiledCode = decompilePreview(tempFile, cbFilterSdk.isChecked)
                 tvStatus.text = "状态: 反编译完成"
                 tvCode.text = decompiledCode
@@ -140,20 +139,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 新增：过滤匹配逻辑（跳过谷歌服务、广告、Firebase、AndroidX系统包、Kotlin标准库）
     private fun shouldFilter(className: String): Boolean {
-        return className.startsWith("com.google.android.gms") || // 谷歌服务、广告等
-               className.startsWith("com.google.firebase") ||    // Firebase
-               className.startsWith("androidx.") ||               // Jetpack组件
-               className.startsWith("android.support") ||         // 传统兼容包
-               className.startsWith("kotlin.") ||                 // Kotlin 核心库
-               className.startsWith("kotlinx.")                   // Kotlin 协程与扩展库
+        return className.startsWith("com.google.android.gms") || 
+               className.startsWith("com.google.firebase") ||    
+               className.startsWith("androidx.") ||               
+               className.startsWith("android.support") ||         
+               className.startsWith("kotlin.") ||                 
+               className.startsWith("kotlinx.")                   
     }
 
-    // 预览区支持过滤显示
     private suspend fun decompilePreview(file: File, filterSdk: Boolean): String = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
         try {
+            // 每次生成独立的 Args 实例
             val args = JadxArgs().apply {
                 inputFiles = listOf(file)
                 isSkipResources = true 
@@ -162,7 +160,6 @@ class MainActivity : AppCompatActivity() {
             JadxDecompiler(args).use { decompiler ->
                 decompiler.load()
                 
-                // 根据过滤选择，筛选出非 SDK 类
                 val rawClasses = decompiler.classes
                 val filteredClasses = if (filterSdk) {
                     rawClasses.filter { !shouldFilter(it.fullName) }
@@ -200,13 +197,11 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             val baseName = currentFileName.substringBeforeLast(".")
-            // 命名区分是否启用了过滤
             val filterSuffix = if (cbFilterSdk.isChecked) "_filtered" else ""
             val exportFileName = "${baseName}${filterSuffix}_decompiled.txt"
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                // 传入复选框的状态值
                 val success = doStreamingDecompile(file, outputStream, cbFilterSdk.isChecked) { current, total, className ->
                     withContext(Dispatchers.Main) {
                         tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
@@ -251,25 +246,30 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 导出的流式反编译支持过滤
     private suspend fun doStreamingDecompile(
         inputFile: File, 
         outputStream: OutputStream,
-        filterSdk: Boolean, // 接收过滤标志
+        filterSdk: Boolean,
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             outputStream.bufferedWriter().use { writer ->
-                val args = JadxArgs().apply {
-                    inputFiles = listOf(inputFile)
-                    isSkipResources = true
+                
+                // 核心修复 1：定义一个动态生成干净 JadxArgs 和 JadxDecompiler 实例的工厂函数，
+                // 彻底解决之前由于 args 状态被复用清理导致第二次 decompiler 启动崩溃的 Bug。
+                val createFreshDecompiler = {
+                    val freshArgs = JadxArgs().apply {
+                        inputFiles = listOf(inputFile)
+                        isSkipResources = true
+                    }
+                    JadxDecompiler(freshArgs)
                 }
 
-                // 先获取总类列表并进行过滤预处理
+                // 1. 采用干净实例获取总类列表并进行过滤
                 var totalClassesCount = 0
-                val classesToDecompile = ArrayList<String>() // 存储需要反编译的类名全称
+                val classesToDecompile = ArrayList<String>()
 
-                JadxDecompiler(args).use { decompiler ->
+                createFreshDecompiler().use { decompiler ->
                     decompiler.load()
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
@@ -282,7 +282,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 writer.write("// ==========================================\n")
-                writer.write("//  JADX 手机版 自动生成 (内存优化分批重建版)\n")
+                writer.write("//  JADX 手机版 自动生成 (极致安全容灾版)\n")
                 writer.write("//  源文件: $currentFileName\n")
                 writer.write("//  总类数: $totalClassesCount\n")
                 writer.write("//  实际导出类数(已过滤SDK): ${classesToDecompile.size}\n")
@@ -298,12 +298,12 @@ class MainActivity : AppCompatActivity() {
                 while (classIndex < totalExportCount) {
                     yield() 
                     
-                    Log.d(TAG, "===> 创建全新的 JADX 实例，当前索引: $classIndex")
+                    Log.d(TAG, "===> 正在创建全新 JADX 实例，当前索引: $classIndex")
                     
-                    JadxDecompiler(args).use { decompiler ->
+                    // 核心修复 1：使用干净工厂方法创建实例
+                    createFreshDecompiler().use { decompiler ->
                         decompiler.load()
                         
-                        // 由于重新载入，这里通过映射来按名称匹配我们要解析的类，避免对已卸载类的重复加载
                         val classesMap = decompiler.classes.associateBy { it.fullName }
                         val batchEnd = minOf(classIndex + BATCH_SIZE, totalExportCount)
                         
@@ -317,9 +317,20 @@ class MainActivity : AppCompatActivity() {
                                 Log.i(TAG, "[$currentCount/$totalExportCount] 正在解析: ${cls.fullName} | 当前堆已用: ${usedMemory}MB")
                                 
                                 writer.write("// [类 $currentCount/$totalExportCount] 类名: ${cls.fullName}\n")
-                                writer.write(cls.code)
-                                writer.write("\n\n// ------------------------------------------\n\n")
                                 
+                                // 核心修复 2：针对每一个单独类的反编译动作进行 try-catch 隔离，
+                                // 确保即使某个畸形混淆类导致 JADX 反编译崩溃抛出异常，整个文件流也不会中断，依然会继续解析下一个类！
+                                try {
+                                    val code = cls.code
+                                    writer.write(code)
+                                } catch (e: Throwable) {
+                                    Log.e(TAG, "类 ${cls.fullName} 解析发生致命异常（已跳过此类的反编译代码输出）: ${e.localizedMessage}")
+                                    writer.write("// !!! 警告：该类反编译失败 (已自动跳过) !!!\n")
+                                    writer.write("// 错误异常类型: ${e.javaClass.simpleName}\n")
+                                    writer.write("// 错误日志信息: ${e.localizedMessage}\n")
+                                }
+                                
+                                writer.write("\n\n// ------------------------------------------\n\n")
                                 cls.unload() 
                             }
                             
@@ -335,13 +346,13 @@ class MainActivity : AppCompatActivity() {
                     } 
 
                     System.gc()
-                    Log.d(TAG, "===> 已销毁旧 JADX 实例，主动回收垃圾。当前堆已用: ${(runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)}MB")
+                    Log.d(TAG, "===> 主动垃圾回收成功。当前堆已用: ${(runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)}MB")
                 }
                 writer.flush()
             }
             true
         } catch (e: Exception) {
-            Log.e(TAG, "导出过程中发生致命错误: ${e.localizedMessage}")
+            Log.e(TAG, "导出过程中发生致命异常: ${e.localizedMessage}")
             e.printStackTrace()
             false
         }
