@@ -4,12 +4,12 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.widget.Button
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-// 核心修复：修改为 JADX 1.4.7 对应的导包路径
 import jadx.api.JadxArgs
 import jadx.api.JadxDecompiler
 import kotlinx.coroutines.Dispatchers
@@ -45,7 +45,7 @@ class MainActivity : AppCompatActivity() {
         btnSelectFile.setOnClickListener {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
-                type = "*/*" // 允许选择任意文件，JADX 内部会识别格式
+                type = "*/*" 
             }
             filePickerLauncher.launch(intent)
         }
@@ -68,11 +68,38 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 将系统 Uri 转换为本地 File 以供 JADX 读取
+    // 新增：获取用户选择文件的真实文件名（包含后缀如 .class）
+    private fun getFileNameFromUri(uri: Uri): String {
+        var name = "temp_file"
+        if (uri.scheme == "content") {
+            val cursor = contentResolver.query(uri, null, null, null, null)
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val index = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index != -1) {
+                        name = it.getString(index)
+                    }
+                }
+            }
+        } else {
+            uri.path?.let { path ->
+                val cut = path.lastIndexOf('/')
+                if (cut != -1) {
+                    name = path.substring(cut + 1)
+                }
+            }
+        }
+        return name
+    }
+
+    // 复制文件并保留其原本的后缀名
     private suspend fun copyUriToTempFile(uri: Uri): File? = withContext(Dispatchers.IO) {
         try {
             val inputStream = contentResolver.openInputStream(uri) ?: return@withContext null
-            val tempFile = File(cacheDir, "temp_input_file")
+            val realFileName = getFileNameFromUri(uri) // 获取带后缀的真实文件名
+            val tempFile = File(cacheDir, realFileName)
+            
+            // 清理旧缓存文件
             if (tempFile.exists()) tempFile.delete()
             
             FileOutputStream(tempFile).use { outputStream ->
@@ -85,24 +112,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 后台反编译逻辑
     private suspend fun decompile(file: File): String = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
         try {
             val args = JadxArgs().apply {
                 inputFiles = listOf(file)
-                isSkipResources = true // 仅解析代码，加快速度
+                isSkipResources = true 
             }
 
             JadxDecompiler(args).use { decompiler ->
                 decompiler.load()
                 val classes = decompiler.classes
                 if (classes.isEmpty()) {
-                    return@withContext "未在文件中找到可解析的类。"
+                    return@withContext "未在文件中找到可解析的类。请确认该文件是有效的 .class, .jar 或 .apk 文件。"
                 }
                 
                 sb.append("// 成功解析，共找到 ${classes.size} 个类\n\n")
-                // 限制一次性展示的数量以防界面卡死，此处默认读取前 5 个类
                 val displayLimit = minOf(classes.size, 5)
                 for (i in 0 until displayLimit) {
                     val cls = classes[i]
@@ -111,7 +136,7 @@ class MainActivity : AppCompatActivity() {
                     sb.append("\n\n// ==========================================\n\n")
                 }
                 if (classes.size > displayLimit) {
-                    sb.append("// ... 其余 ${classes.size - displayLimit} 个类未完全展示。")
+                    sb.append("// ... 其余 ${classes.size - displayLimit} 个类未完全展示 ...")
                 }
             }
         } catch (e: Exception) {
