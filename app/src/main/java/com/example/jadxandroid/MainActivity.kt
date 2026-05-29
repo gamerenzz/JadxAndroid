@@ -9,10 +9,10 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import jadx.api.JadxArgs
@@ -20,11 +20,14 @@ import jadx.api.JadxDecompiler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 
 class MainActivity : AppCompatActivity() {
+
+    private val TAG = "JadxAndroidExport"
 
     private lateinit var btnSelectFile: Button
     private lateinit var btnSaveTxt: Button
@@ -166,7 +169,6 @@ class MainActivity : AppCompatActivity() {
         sb.toString()
     }
 
-    // 导出完整源码（包含实时进度更新）
     private fun exportAllSourceToTxt(file: File) {
         tvStatus.text = "状态: 正在初始化导出..."
         btnSaveTxt.isEnabled = false
@@ -178,19 +180,18 @@ class MainActivity : AppCompatActivity() {
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                // 调用流式反编译，并传入进度更新的回调函数
-                val success = doStreamingDecompile(file, outputStream) { current, total ->
-                    // 回调在后台线程运行，必须切换回主线程（Main）更新 UI 界面
+                // 回调函数增加 className 参数，用于在主屏幕上实时显示具体卡在哪个类
+                val success = doStreamingDecompile(file, outputStream) { current, total, className ->
                     withContext(Dispatchers.Main) {
-                        tvStatus.text = "状态: 正在导出完整源码到 TXT... ($current / $total)"
+                        tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
                     }
                 }
                 
                 if (success) {
-                    tvStatus.text = "状态: 导出成功！已保存在：Download/$exportFileName"
+                    tvStatus.text = "状态: 导出成功！文件已保存在：Download/$exportFileName"
                     Toast.makeText(this@MainActivity, "保存成功，请去手机『下载/Download』文件夹查看", Toast.LENGTH_LONG).show()
                 } else {
-                    tvStatus.text = "状态: 导出失败"
+                    tvStatus.text = "状态: 导出失败（可能因某特定类卡死或崩溃）"
                     Toast.makeText(this@MainActivity, "写入文件失败", Toast.LENGTH_SHORT).show()
                 }
             } else {
@@ -224,11 +225,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 执行流式反编译，支持实时进度报告
     private suspend fun doStreamingDecompile(
         inputFile: File, 
         outputStream: OutputStream,
-        onProgress: suspend (current: Int, total: Int) -> Unit // 挂起函数回调，方便切回主线程
+        onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             outputStream.bufferedWriter().use { writer ->
@@ -247,25 +247,43 @@ class MainActivity : AppCompatActivity() {
                     writer.write("//  类总数: ${classes.size}\n")
                     writer.write("// ==========================================\n\n")
                     
+                    var lastUpdateTime = 0L
+                    val runtime = Runtime.getRuntime()
+
                     classes.forEachIndexed { index, cls ->
-                        writer.write("// [类 ${index + 1}/${classes.size}] 类名: ${cls.fullName}\n")
+                        val currentCount = index + 1
+                        
+                        // 1. 向系统 Logcat 输出当前反编译类的具体信息以及堆内存占用情况，方便排查崩溃
+                        val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
+                        Log.i(TAG, "[$currentCount/${classes.size}] 正在解析类: ${cls.fullName} | 当前堆内存已用: ${usedMemory}MB")
+                        
+                        // 2. 写入文件
+                        writer.write("// [类 $currentCount/${classes.size}] 类名: ${cls.fullName}\n")
                         writer.write(cls.code)
                         writer.write("\n\n// ------------------------------------------\n\n")
                         
-                        // 写完一个，立刻释放一个类内存，防 OOM
+                        // 3. 内存释放
                         cls.unload() 
                         
-                        // 进度节流更新：每 10 个类或者到最后一个类时更新一次界面进度
-                        val currentCount = index + 1
-                        if (currentCount % 10 == 0 || currentCount == classes.size) {
-                            onProgress(currentCount, classes.size)
+                        // 4. 防抖更新机制：限制最快每 500 毫秒才更新一次 UI。
+                        // 既保证了进度的流畅展示，又彻底避免了频繁更新 UI 导致的系统响应堵塞。
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastUpdateTime > 500 || currentCount == classes.size) {
+                            lastUpdateTime = currentTime
+                            // 将当前解析的类名 cls.fullName 也传回界面，卡死时一眼便知卡在哪个类上
+                            onProgress(currentCount, classes.size, cls.fullName)
                         }
+
+                        // 5. 极其重要：在每一次循环中主动让出时间片，
+                        // 给操作系统的其他线程（如系统的垃圾回收器 GC、主 UI 线程）运行机会，防止应用被判定为 ANR
+                        yield()
                     }
                     writer.flush()
                 }
             }
             true
         } catch (e: Exception) {
+            Log.e(TAG, "导出过程中发生致命错误: ${e.localizedMessage}")
             e.printStackTrace()
             false
         }
