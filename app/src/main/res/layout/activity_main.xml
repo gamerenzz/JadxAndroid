@@ -5,7 +5,7 @@
     android:orientation="vertical"
     android:padding="16dp">
 
-    <!-- 两个按钮并排排列 -->
+    <!-- 按钮并排 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -25,8 +25,17 @@
             android:layout_weight="1"
             android:layout_marginStart="8dp"
             android:text="保存为TXT"
-            android:enabled="false" /> <!-- 默认禁用，解析后启用 -->
+            android:enabled="false" />
     </LinearLayout>
+
+    <!-- 新增：过滤 SDK 的复选框（默认勾选） -->
+    <CheckBox
+        android:id="@+id/cb_filter_sdk"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="过滤SDK (跳过谷歌/AndroidX/Kotlin等)"
+        android:checked="true" />
 
     <TextView
         android:id="@+id/tv_status"
