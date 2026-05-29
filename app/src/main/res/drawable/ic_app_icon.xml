@@ -1,0 +1,14 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 背景：安卓经典绿色圆形 -->
+    <path
+        android:fillColor="#00C853"
+        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z" />
+    <!-- 前景：白色反编译代码括号 < / > -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M9.4,16.6L4.8,12l4.6,-4.6L10.8,8.8L7.6,12l3.2,3.2L9.4,16.6z M14.6,16.6l-1.4,-1.4l3.2,-3.2l-3.2,-3.2l1.4,-1.4l4.6,4.6L14.6,16.6z M12,6h2l-3,12h-2z" />
+</vector>
