@@ -13,6 +13,7 @@ import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts 
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import jadx.api.JadxArgs
@@ -24,7 +25,6 @@ import kotlinx.coroutines.yield
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
-import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : AppCompatActivity() {
 
@@ -181,7 +181,6 @@ class MainActivity : AppCompatActivity() {
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                // 回调函数增加 className 参数，用于在主屏幕上实时显示具体卡在哪个类
                 val success = doStreamingDecompile(file, outputStream) { current, total, className ->
                     withContext(Dispatchers.Main) {
                         tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
@@ -226,6 +225,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 实现了分批重建与主动垃圾回收的安全反编译流
     private suspend fun doStreamingDecompile(
         inputFile: File, 
         outputStream: OutputStream,
@@ -238,49 +238,69 @@ class MainActivity : AppCompatActivity() {
                     isSkipResources = true
                 }
 
+                // 1. 首先加载一次，仅用于获取总类数（速度极快）
+                var totalClassesCount = 0
                 JadxDecompiler(args).use { decompiler ->
                     decompiler.load()
-                    val classes = decompiler.classes
-                    
-                    writer.write("// ==========================================\n")
-                    writer.write("//  JADX 手机版 自动生成\n")
-                    writer.write("//  源文件: $currentFileName\n")
-                    writer.write("//  类总数: ${classes.size}\n")
-                    writer.write("// ==========================================\n\n")
-                    
-                    var lastUpdateTime = 0L
-                    val runtime = Runtime.getRuntime()
-
-                    classes.forEachIndexed { index, cls ->
-                        val currentCount = index + 1
-                        
-                        // 1. 向系统 Logcat 输出当前反编译类的具体信息以及堆内存占用情况，方便排查崩溃
-                        val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
-                        Log.i(TAG, "[$currentCount/${classes.size}] 正在解析类: ${cls.fullName} | 当前堆内存已用: ${usedMemory}MB")
-                        
-                        // 2. 写入文件
-                        writer.write("// [类 $currentCount/${classes.size}] 类名: ${cls.fullName}\n")
-                        writer.write(cls.code)
-                        writer.write("\n\n// ------------------------------------------\n\n")
-                        
-                        // 3. 内存释放
-                        cls.unload() 
-                        
-                        // 4. 防抖更新机制：限制最快每 500 毫秒才更新一次 UI。
-                        // 既保证了进度的流畅展示，又彻底避免了频繁更新 UI 导致的系统响应堵塞。
-                        val currentTime = System.currentTimeMillis()
-                        if (currentTime - lastUpdateTime > 500 || currentCount == classes.size) {
-                            lastUpdateTime = currentTime
-                            // 将当前解析的类名 cls.fullName 也传回界面，卡死时一眼便知卡在哪个类上
-                            onProgress(currentCount, classes.size, cls.fullName)
-                        }
-
-                        // 5. 极其重要：在每一次循环中主动让出时间片，
-                        // 给操作系统的其他线程（如系统的垃圾回收器 GC、主 UI 线程）运行机会，防止应用被判定为 ANR
-                        yield()
-                    }
-                    writer.flush()
+                    totalClassesCount = decompiler.classes.size
                 }
+
+                writer.write("// ==========================================\n")
+                writer.write("//  JADX 手机版 自动生成 (内存优化分批重建版)\n")
+                writer.write("//  源文件: $currentFileName\n")
+                writer.write("//  类总数: $totalClassesCount\n")
+                writer.write("// ==========================================\n\n")
+                
+                var lastUpdateTime = 0L
+                val runtime = Runtime.getRuntime()
+                
+                // 核心控制参数：每反编译 300 个类就彻底销毁并重建一次 JADX 实例，彻底释放内存
+                val BATCH_SIZE = 300 
+                var classIndex = 0
+
+                while (classIndex < totalClassesCount) {
+                    yield() // 释放协程时间片，保持 UI 线程活跃
+                    
+                    Log.d(TAG, "===> 创建全新的 JADX 实例，当前索引: $classIndex")
+                    
+                    JadxDecompiler(args).use { decompiler ->
+                        decompiler.load()
+                        val classes = decompiler.classes
+                        
+                        // 计算当前批次的结束位置
+                        val batchEnd = minOf(classIndex + BATCH_SIZE, classes.size)
+                        
+                        for (i in classIndex until batchEnd) {
+                            val cls = classes[i]
+                            val currentCount = i + 1
+                            
+                            // 打印内存状态
+                            val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
+                            Log.i(TAG, "[$currentCount/$totalClassesCount] 正在解析: ${cls.fullName} | 当前堆已用: ${usedMemory}MB")
+                            
+                            writer.write("// [类 $currentCount/$totalClassesCount] 类名: ${cls.fullName}\n")
+                            writer.write(cls.code)
+                            writer.write("\n\n// ------------------------------------------\n\n")
+                            
+                            cls.unload() // 释放当前类的源码占用
+                            
+                            // 限制最快每 500ms 更新一次 UI 进度
+                            val currentTime = System.currentTimeMillis()
+                            if (currentTime - lastUpdateTime > 500 || currentCount == totalClassesCount) {
+                                lastUpdateTime = currentTime
+                                onProgress(currentCount, totalClassesCount, cls.fullName)
+                            }
+                            
+                            yield()
+                        }
+                        classIndex = batchEnd
+                    } // 退出 use 块后，JadxDecompiler 被 close()，释放累计 300 个类的所有 AST 树和全局缓存
+
+                    // 重建间隔，主动触发系统垃圾清理
+                    System.gc()
+                    Log.d(TAG, "===> 已销毁旧 JADX 实例，主动回收垃圾。当前堆已用: ${(runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)}MB")
+                }
+                writer.flush()
             }
             true
         } catch (e: Exception) {
