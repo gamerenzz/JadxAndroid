@@ -9,8 +9,9 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import io.github.skylot.jadx.api.JadxArgs
-import io.github.skylot.jadx.api.JadxDecompiler
+// 核心修复：修改为 JADX 1.4.7 对应的导包路径
+import jadx.api.JadxArgs
+import jadx.api.JadxDecompiler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
