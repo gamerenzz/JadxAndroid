@@ -11,6 +11,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Button
+import android.widget.CheckBox // 引入 CheckBox
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts 
@@ -32,6 +33,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var btnSelectFile: Button
     private lateinit var btnSaveTxt: Button
+    private lateinit var cbFilterSdk: CheckBox // 声明 CheckBox
     private lateinit var tvStatus: TextView
     private lateinit var tvCode: TextView
 
@@ -54,6 +56,7 @@ class MainActivity : AppCompatActivity() {
 
         btnSelectFile = findViewById(R.id.btn_select_file)
         btnSaveTxt = findViewById(R.id.btn_save_txt)
+        cbFilterSdk = findViewById(R.id.cb_filter_sdk) // 绑定 CheckBox
         tvStatus = findViewById(R.id.tv_status)
         tvCode = findViewById(R.id.tv_code)
 
@@ -85,7 +88,8 @@ class MainActivity : AppCompatActivity() {
             if (tempFile != null && tempFile.exists()) {
                 currentPreparedFile = tempFile
                 tvStatus.text = "状态: 正在反编译中，请稍候..."
-                val decompiledCode = decompilePreview(tempFile)
+                // 传入是否开启过滤的参数
+                val decompiledCode = decompilePreview(tempFile, cbFilterSdk.isChecked)
                 tvStatus.text = "状态: 反编译完成"
                 tvCode.text = decompiledCode
                 btnSaveTxt.isEnabled = true 
@@ -136,7 +140,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private suspend fun decompilePreview(file: File): String = withContext(Dispatchers.IO) {
+    // 新增：过滤匹配逻辑（跳过谷歌服务、广告、Firebase、AndroidX系统包、Kotlin标准库）
+    private fun shouldFilter(className: String): Boolean {
+        return className.startsWith("com.google.android.gms") || // 谷歌服务、广告等
+               className.startsWith("com.google.firebase") ||    // Firebase
+               className.startsWith("androidx.") ||               // Jetpack组件
+               className.startsWith("android.support") ||         // 传统兼容包
+               className.startsWith("kotlin.") ||                 // Kotlin 核心库
+               className.startsWith("kotlinx.")                   // Kotlin 协程与扩展库
+    }
+
+    // 预览区支持过滤显示
+    private suspend fun decompilePreview(file: File, filterSdk: Boolean): String = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
         try {
             val args = JadxArgs().apply {
@@ -146,21 +161,29 @@ class MainActivity : AppCompatActivity() {
 
             JadxDecompiler(args).use { decompiler ->
                 decompiler.load()
-                val classes = decompiler.classes
-                if (classes.isEmpty()) {
-                    return@withContext "未在文件中找到可解析的类。"
+                
+                // 根据过滤选择，筛选出非 SDK 类
+                val rawClasses = decompiler.classes
+                val filteredClasses = if (filterSdk) {
+                    rawClasses.filter { !shouldFilter(it.fullName) }
+                } else {
+                    rawClasses
+                }
+
+                if (filteredClasses.isEmpty()) {
+                    return@withContext "未在文件中找到可解析的类（可能均被 SDK 过滤器过滤）。"
                 }
                 
-                sb.append("// 成功解析，共找到 ${classes.size} 个类\n\n")
-                val displayLimit = minOf(classes.size, 5)
+                sb.append("// 成功解析，共找到 ${rawClasses.size} 个类（已过滤保留 ${filteredClasses.size} 个类）\n\n")
+                val displayLimit = minOf(filteredClasses.size, 5)
                 for (i in 0 until displayLimit) {
-                    val cls = classes[i]
+                    val cls = filteredClasses[i]
                     sb.append("// 类名: ${cls.fullName}\n")
                     sb.append(cls.code)
                     sb.append("\n\n// ==========================================\n\n")
                 }
-                if (classes.size > displayLimit) {
-                    sb.append("// ... 其余 ${classes.size - displayLimit} 个类未完全展示 ...")
+                if (filteredClasses.size > displayLimit) {
+                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未完全展示 ...")
                 }
             }
         } catch (e: Exception) {
@@ -177,11 +200,14 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             val baseName = currentFileName.substringBeforeLast(".")
-            val exportFileName = "${baseName}_decompiled.txt"
+            // 命名区分是否启用了过滤
+            val filterSuffix = if (cbFilterSdk.isChecked) "_filtered" else ""
+            val exportFileName = "${baseName}${filterSuffix}_decompiled.txt"
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                val success = doStreamingDecompile(file, outputStream) { current, total, className ->
+                // 传入复选框的状态值
+                val success = doStreamingDecompile(file, outputStream, cbFilterSdk.isChecked) { current, total, className ->
                     withContext(Dispatchers.Main) {
                         tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
                     }
@@ -225,10 +251,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 实现了分批重建与主动垃圾回收的安全反编译流
+    // 导出的流式反编译支持过滤
     private suspend fun doStreamingDecompile(
         inputFile: File, 
         outputStream: OutputStream,
+        filterSdk: Boolean, // 接收过滤标志
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
@@ -238,65 +265,75 @@ class MainActivity : AppCompatActivity() {
                     isSkipResources = true
                 }
 
-                // 1. 首先加载一次，仅用于获取总类数（速度极快）
+                // 先获取总类列表并进行过滤预处理
                 var totalClassesCount = 0
+                val classesToDecompile = ArrayList<String>() // 存储需要反编译的类名全称
+
                 JadxDecompiler(args).use { decompiler ->
                     decompiler.load()
-                    totalClassesCount = decompiler.classes.size
+                    val rawClasses = decompiler.classes
+                    totalClassesCount = rawClasses.size
+                    
+                    for (cls in rawClasses) {
+                        if (!filterSdk || !shouldFilter(cls.fullName)) {
+                            classesToDecompile.add(cls.fullName)
+                        }
+                    }
                 }
 
                 writer.write("// ==========================================\n")
                 writer.write("//  JADX 手机版 自动生成 (内存优化分批重建版)\n")
                 writer.write("//  源文件: $currentFileName\n")
-                writer.write("//  类总数: $totalClassesCount\n")
+                writer.write("//  总类数: $totalClassesCount\n")
+                writer.write("//  实际导出类数(已过滤SDK): ${classesToDecompile.size}\n")
                 writer.write("// ==========================================\n\n")
                 
                 var lastUpdateTime = 0L
                 val runtime = Runtime.getRuntime()
                 
-                // 核心控制参数：每反编译 300 个类就彻底销毁并重建一次 JADX 实例，彻底释放内存
                 val BATCH_SIZE = 300 
                 var classIndex = 0
+                val totalExportCount = classesToDecompile.size
 
-                while (classIndex < totalClassesCount) {
-                    yield() // 释放协程时间片，保持 UI 线程活跃
+                while (classIndex < totalExportCount) {
+                    yield() 
                     
                     Log.d(TAG, "===> 创建全新的 JADX 实例，当前索引: $classIndex")
                     
                     JadxDecompiler(args).use { decompiler ->
                         decompiler.load()
-                        val classes = decompiler.classes
                         
-                        // 计算当前批次的结束位置
-                        val batchEnd = minOf(classIndex + BATCH_SIZE, classes.size)
+                        // 由于重新载入，这里通过映射来按名称匹配我们要解析的类，避免对已卸载类的重复加载
+                        val classesMap = decompiler.classes.associateBy { it.fullName }
+                        val batchEnd = minOf(classIndex + BATCH_SIZE, totalExportCount)
                         
                         for (i in classIndex until batchEnd) {
-                            val cls = classes[i]
+                            val clsName = classesToDecompile[i]
+                            val cls = classesMap[clsName]
                             val currentCount = i + 1
                             
-                            // 打印内存状态
-                            val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
-                            Log.i(TAG, "[$currentCount/$totalClassesCount] 正在解析: ${cls.fullName} | 当前堆已用: ${usedMemory}MB")
+                            if (cls != null) {
+                                val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
+                                Log.i(TAG, "[$currentCount/$totalExportCount] 正在解析: ${cls.fullName} | 当前堆已用: ${usedMemory}MB")
+                                
+                                writer.write("// [类 $currentCount/$totalExportCount] 类名: ${cls.fullName}\n")
+                                writer.write(cls.code)
+                                writer.write("\n\n// ------------------------------------------\n\n")
+                                
+                                cls.unload() 
+                            }
                             
-                            writer.write("// [类 $currentCount/$totalClassesCount] 类名: ${cls.fullName}\n")
-                            writer.write(cls.code)
-                            writer.write("\n\n// ------------------------------------------\n\n")
-                            
-                            cls.unload() // 释放当前类的源码占用
-                            
-                            // 限制最快每 500ms 更新一次 UI 进度
                             val currentTime = System.currentTimeMillis()
-                            if (currentTime - lastUpdateTime > 500 || currentCount == totalClassesCount) {
+                            if (currentTime - lastUpdateTime > 500 || currentCount == totalExportCount) {
                                 lastUpdateTime = currentTime
-                                onProgress(currentCount, totalClassesCount, cls.fullName)
+                                onProgress(currentCount, totalExportCount, clsName)
                             }
                             
                             yield()
                         }
                         classIndex = batchEnd
-                    } // 退出 use 块后，JadxDecompiler 被 close()，释放累计 300 个类的所有 AST 树和全局缓存
+                    } 
 
-                    // 重建间隔，主动触发系统垃圾清理
                     System.gc()
                     Log.d(TAG, "===> 已销毁旧 JADX 实例，主动回收垃圾。当前堆已用: ${(runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)}MB")
                 }
