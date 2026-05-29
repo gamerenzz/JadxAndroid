@@ -37,8 +37,11 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
-    // 使用极其稳定的 JADX 1.4.7 核心库（内置了所有解析插件，避免 1.5.0 的下载报错）
+    // 核心引擎
     implementation 'io.github.skylot:jadx-core:1.4.7'
+    // 必须添加以下两个输入插件，JADX 才能识别并加载 class 和 dex 文件
+    implementation 'io.github.skylot:jadx-dex-input:1.4.7'
+    implementation 'io.github.skylot:jadx-java-input:1.4.7'
 
     // 异步协程支持
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
