@@ -180,13 +180,20 @@ class CfrEngine(
     private fun decompileSingleClass(classFile: File): String {
         val sb = StringBuilder()
         val sinkFactory = object : OutputSinkFactory {
-            // 修正方法 1：正确覆写 getTypes()
-            override fun getTypes(): List<OutputSinkFactory.SinkClass>? {
+            
+            // 核心修复 1：覆写符合 CFR 0.152 标准的 getSupportedSinks 方法
+            override fun getSupportedSinks(
+                sinkType: OutputSinkFactory.SinkType?, 
+                available: MutableCollection<OutputSinkFactory.SinkClass>?
+            ): List<OutputSinkFactory.SinkClass>? {
                 return listOf(OutputSinkFactory.SinkClass.DECOMPILED)
             }
 
-            // 修正方法 2：正确对调 SinkType 和 SinkClass 的参数顺序，并处理平台可空类型
-            override fun <T> getSink(sinkType: OutputSinkFactory.SinkType?, sinkClass: OutputSinkFactory.SinkClass?): OutputSinkFactory.Sink<T>? {
+            // 核心修复 2：覆写 getSink 方法
+            override fun <T> getSink(
+                sinkType: OutputSinkFactory.SinkType?, 
+                sinkClass: OutputSinkFactory.SinkClass?
+            ): OutputSinkFactory.Sink<T>? {
                 return OutputSinkFactory.Sink { obj ->
                     sb.append(obj)
                 }
@@ -194,7 +201,7 @@ class CfrEngine(
         }
 
         val options = HashMap<String, String>()
-        options["showversion"] = "false" // 移除 CFR 版本号输出，让排版更干净
+        options["showversion"] = "false" // 移除 CFR 版本号输出
         val driver = CfrDriver.Builder()
             .withOptions(options)
             .withOutputSink(sinkFactory)
