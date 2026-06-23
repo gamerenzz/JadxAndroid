@@ -19,29 +19,34 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts 
 import androidx.appcompat.app.AppCompatActivity
+import androidx.documentfile.provider.DocumentFile // 核心引入：安卓 SAF 文件目录树支持库
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var btnSelectFile: Button
+    private lateinit var btnSelectFolder: Button // 新增：选择目录按钮
     private lateinit var btnSaveTxt: Button
     private lateinit var cbFilterSdk: CheckBox 
-    private lateinit var spEngine: Spinner // 绑定下拉选择器
+    private lateinit var spEngine: Spinner 
     private lateinit var tvStatus: TextView
     private lateinit var tvCode: TextView
 
     private var currentPreparedFile: File? = null 
     private var currentFileName: String = ""       
 
-    // 当前处于活动状态的反编译引擎
     private var activeEngine: DecompilerEngine = JadxEngine("")
 
+    // 文件选择器
     private val filePickerLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -52,34 +57,38 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 核心新增：文件夹/目录选择器
+    private val folderPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri?.let { handleSelectedFolder(it) }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         btnSelectFile = findViewById(R.id.btn_select_file)
+        btnSelectFolder = findViewById(R.id.btn_select_folder) // 绑定按钮
         btnSaveTxt = findViewById(R.id.btn_save_txt)
         cbFilterSdk = findViewById(R.id.cb_filter_sdk) 
         spEngine = findViewById(R.id.sp_engine)
         tvStatus = findViewById(R.id.tv_status)
         tvCode = findViewById(R.id.tv_code)
 
-        // 初始化下拉菜单数据源
         val engineList = arrayOf("JADX (安卓)", "CFR (Java)")
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, engineList)
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spEngine.adapter = adapter
 
-        // 下拉菜单切换事件监听
         spEngine.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                // 根据当前选中的索引，实例化对应引擎
                 activeEngine = if (position == 1) {
                     CfrEngine(this@MainActivity, currentFileName)
                 } else {
                     JadxEngine(currentFileName)
                 }
 
-                // 核心：如果当前已经加载了文件，切换引擎时直接重新反编译刷新预览！
                 if (currentPreparedFile != null) {
                     triggerDecompilePreview()
                 }
@@ -88,7 +97,6 @@ class MainActivity : AppCompatActivity() {
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
-        // 核心：当用户切换“过滤SDK”复选框时，也立即重新反编译，体验极佳
         cbFilterSdk.setOnCheckedChangeListener { _, _ ->
             if (currentPreparedFile != null) {
                 triggerDecompilePreview()
@@ -101,6 +109,11 @@ class MainActivity : AppCompatActivity() {
                 type = "*/*" 
             }
             filePickerLauncher.launch(intent)
+        }
+
+        // 点击“选择目录”启动 SAF 树形结构目录选择
+        btnSelectFolder.setOnClickListener {
+            folderPickerLauncher.launch(null)
         }
 
         btnSaveTxt.setOnClickListener {
@@ -123,16 +136,12 @@ class MainActivity : AppCompatActivity() {
             if (tempFile != null && tempFile.exists()) {
                 currentPreparedFile = tempFile
                 
-                // 智能切换：根据文件类型，自动选择最佳默认引擎位置
-                // .apk/.dex 对应 0 (JADX), 其它对应 1 (CFR)
                 val ext = currentFileName.substringAfterLast(".").lowercase()
                 val idealPosition = if (ext == "apk" || ext == "dex") 0 else 1
 
                 if (spEngine.selectedItemPosition == idealPosition) {
-                    // 如果下拉菜单目前选中的已经是理想引擎，手动触发反编译
                     triggerDecompilePreview()
                 } else {
-                    // 如果不一致，设置选择，将通过 onItemSelectedListener 自动触发反编译
                     spEngine.setSelection(idealPosition)
                 }
             } else {
@@ -141,7 +150,87 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 核心重构：统一的反编译预览执行入口
+    // 核心新增：处理用户选择的本地文件夹
+    private fun handleSelectedFolder(uri: Uri) {
+        tvStatus.text = "状态: 正在打包目录文件，请稍候..."
+        tvCode.text = ""
+        btnSaveTxt.isEnabled = false
+
+        lifecycleScope.launch {
+            val documentFolder = DocumentFile.fromTreeUri(this@MainActivity, uri)
+            if (documentFolder != null && documentFolder.exists()) {
+                currentFileName = documentFolder.name ?: "Folder"
+                val tempZipFile = File(cacheDir, "FolderDecompile.zip")
+                if (tempZipFile.exists()) tempZipFile.delete()
+
+                // 后台流式打包目录内的 class 文件到临时 Zip 包，保留目录树结构
+                val success = withContext(Dispatchers.IO) {
+                    try {
+                        FileOutputStream(tempZipFile).use { fos ->
+                            ZipOutputStream(fos).use { zos ->
+                                zipDocumentFolder(documentFolder, zos)
+                            }
+                        }
+                        true
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        false
+                    }
+                }
+
+                if (success && tempZipFile.exists() && tempZipFile.length() > 0) {
+                    currentPreparedFile = tempZipFile
+                    // 文件夹反编译全都是类文件，默认定位到最适的 CFR (Java) 引擎 (索引 1)
+                    val idealPosition = 1
+                    if (spEngine.selectedItemPosition == idealPosition) {
+                        triggerDecompilePreview()
+                    } else {
+                        spEngine.setSelection(idealPosition)
+                    }
+                } else {
+                    tvStatus.text = "状态: 目录打包失败或未在其内找到任何类文件"
+                }
+            } else {
+                tvStatus.text = "状态: 无法访问选中的目录"
+            }
+        }
+    }
+
+    // 核心新增：递归遍历 DocumentTree，并将 class 和 jar 流式压缩入包
+    private suspend fun zipDocumentFolder(
+        folder: DocumentFile, 
+        zipOut: ZipOutputStream, 
+        currentPath: String = ""
+    ): Unit = withContext(Dispatchers.IO) {
+        val files = folder.listFiles()
+        for (file in files) {
+            yield() // 保持协程协作，防卡死
+            if (file.isDirectory) {
+                val nextPath = if (currentPath.isEmpty()) file.name else "$currentPath/${file.name}"
+                if (nextPath != null) {
+                    zipDocumentFolder(file, zipOut, nextPath)
+                }
+            } else {
+                val name = file.name ?: continue
+                val isClassOrJar = name.endsWith(".class", ignoreCase = true) || name.endsWith(".jar", ignoreCase = true)
+                if (isClassOrJar) {
+                    // 拼接保留相对路径，供反编译引擎进行类路径 Inline 分析
+                    val entryName = if (currentPath.isEmpty()) name else "$currentPath/$name"
+                    val entry = ZipEntry(entryName)
+                    try {
+                        zipOut.putNextEntry(entry)
+                        contentResolver.openInputStream(file.uri)?.use { input ->
+                            input.copyTo(zipOut)
+                        }
+                        zipOut.closeEntry()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+        }
+    }
+
     private fun triggerDecompilePreview() {
         val tempFile = currentPreparedFile ?: return
         if (!tempFile.exists()) return
@@ -203,6 +292,7 @@ class MainActivity : AppCompatActivity() {
         tvStatus.text = "状态: 正在初始化导出 (引擎: ${activeEngine.getName()})..."
         btnSaveTxt.isEnabled = false
         btnSelectFile.isEnabled = false
+        btnSelectFolder.isEnabled = false
 
         lifecycleScope.launch {
             val baseName = currentFileName.substringBeforeLast(".")
@@ -211,7 +301,6 @@ class MainActivity : AppCompatActivity() {
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                // 调用当前活动引擎执行完整的流式导出
                 val success = activeEngine.decompileAll(file, outputStream, cbFilterSdk.isChecked) { current, total, className ->
                     withContext(Dispatchers.Main) {
                         tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
@@ -230,6 +319,7 @@ class MainActivity : AppCompatActivity() {
             }
             btnSaveTxt.isEnabled = true
             btnSelectFile.isEnabled = true
+            btnSelectFolder.isEnabled = true
         }
     }
 
