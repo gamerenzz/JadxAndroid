@@ -180,11 +180,13 @@ class CfrEngine(
     private fun decompileSingleClass(classFile: File): String {
         val sb = StringBuilder()
         val sinkFactory = object : OutputSinkFactory {
-            override fun getListTypes(): List<OutputSinkFactory.SinkClass> {
+            // 修正方法 1：正确覆写 getTypes()
+            override fun getTypes(): List<OutputSinkFactory.SinkClass>? {
                 return listOf(OutputSinkFactory.SinkClass.DECOMPILED)
             }
 
-            override fun <T> getSink(sinkClass: OutputSinkFactory.SinkClass, sinkType: OutputSinkFactory.SinkType): OutputSinkFactory.Sink<T> {
+            // 修正方法 2：正确对调 SinkType 和 SinkClass 的参数顺序，并处理平台可空类型
+            override fun <T> getSink(sinkType: OutputSinkFactory.SinkType?, sinkClass: OutputSinkFactory.SinkClass?): OutputSinkFactory.Sink<T>? {
                 return OutputSinkFactory.Sink { obj ->
                     sb.append(obj)
                 }
