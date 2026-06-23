@@ -9,7 +9,6 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
-import android.util.Log
 import android.widget.Button
 import android.widget.CheckBox 
 import android.widget.TextView
@@ -17,19 +16,14 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts 
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import jadx.api.JadxArgs
-import jadx.api.JadxDecompiler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 
 class MainActivity : AppCompatActivity() {
-
-    private val TAG = "JadxAndroidExport"
 
     private lateinit var btnSelectFile: Button
     private lateinit var btnSaveTxt: Button
@@ -39,6 +33,9 @@ class MainActivity : AppCompatActivity() {
 
     private var currentPreparedFile: File? = null 
     private var currentFileName: String = ""       
+
+    // 默认启用 JADX 引擎，CFR 引擎随时待命
+    private var activeEngine: DecompilerEngine = JadxEngine("")
 
     private val filePickerLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -87,9 +84,21 @@ class MainActivity : AppCompatActivity() {
             val tempFile = copyUriToTempFile(uri)
             if (tempFile != null && tempFile.exists()) {
                 currentPreparedFile = tempFile
-                tvStatus.text = "状态: 正在反编译中，请稍候..."
-                val decompiledCode = decompilePreview(tempFile, cbFilterSdk.isChecked)
-                tvStatus.text = "状态: 反编译完成"
+                
+                // 根据输入的文件类型，智能配置默认的反编译引擎！
+                // 如果是标准 Class/Jar 默认切换到极速 CFR，如果是 Apk/Dex 默认切换到 JADX
+                val ext = currentFileName.substringAfterLast(".").lowercase()
+                activeEngine = if (ext == "apk" || ext == "dex") {
+                    JadxEngine(currentFileName)
+                } else {
+                    CfrEngine(this@MainActivity, currentFileName)
+                }
+
+                tvStatus.text = "状态: 正在反编译中 (引擎: ${activeEngine.getName()})..."
+                
+                val decompiledCode = activeEngine.decompilePreview(tempFile, cbFilterSdk.isChecked)
+                
+                tvStatus.text = "状态: 反编译完成 (引擎: ${activeEngine.getName()})"
                 tvCode.text = decompiledCode
                 btnSaveTxt.isEnabled = true 
             } else {
@@ -139,70 +148,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun shouldFilter(className: String): Boolean {
-        return className.startsWith("com.google.android.gms") || 
-               className.startsWith("com.google.firebase") ||    
-               className.startsWith("androidx.") ||               
-               className.startsWith("android.support") ||         
-               className.startsWith("kotlin.") ||                 
-               className.startsWith("kotlinx.")                   
-    }
-
-    private suspend fun decompilePreview(file: File, filterSdk: Boolean): String = withContext(Dispatchers.IO) {
-        val sb = StringBuilder()
-        try {
-            // 每次生成独立的 Args 实例
-            val args = JadxArgs().apply {
-                inputFiles = listOf(file)
-                isSkipResources = true 
-            }
-
-            JadxDecompiler(args).use { decompiler ->
-                decompiler.load()
-                
-                val rawClasses = decompiler.classes
-                val filteredClasses = if (filterSdk) {
-                    rawClasses.filter { !shouldFilter(it.fullName) }
-                } else {
-                    rawClasses
-                }
-
-                if (filteredClasses.isEmpty()) {
-                    return@withContext "未在文件中找到可解析的类（可能均被 SDK 过滤器过滤）。"
-                }
-                
-                sb.append("// 成功解析，共找到 ${rawClasses.size} 个类（已过滤保留 ${filteredClasses.size} 个类）\n\n")
-                val displayLimit = minOf(filteredClasses.size, 5)
-                for (i in 0 until displayLimit) {
-                    val cls = filteredClasses[i]
-                    sb.append("// 类名: ${cls.fullName}\n")
-                    sb.append(cls.code)
-                    sb.append("\n\n// ==========================================\n\n")
-                }
-                if (filteredClasses.size > displayLimit) {
-                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未完全展示 ...")
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            sb.append("反编译过程中发生错误:\n${e.localizedMessage}")
-        }
-        sb.toString()
-    }
-
     private fun exportAllSourceToTxt(file: File) {
-        tvStatus.text = "状态: 正在初始化导出..."
+        tvStatus.text = "状态: 正在初始化导出 (引擎: ${activeEngine.getName()})..."
         btnSaveTxt.isEnabled = false
         btnSelectFile.isEnabled = false
 
         lifecycleScope.launch {
             val baseName = currentFileName.substringBeforeLast(".")
+            // 导出的文件名上带上当前的引擎标记
             val filterSuffix = if (cbFilterSdk.isChecked) "_filtered" else ""
-            val exportFileName = "${baseName}${filterSuffix}_decompiled.txt"
+            val exportFileName = "${baseName}${filterSuffix}_${activeEngine.getName().lowercase()}_decompiled.txt"
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                val success = doStreamingDecompile(file, outputStream, cbFilterSdk.isChecked) { current, total, className ->
+                // 使用当前的 activeEngine 进行反编译
+                val success = activeEngine.decompileAll(file, outputStream, cbFilterSdk.isChecked) { current, total, className ->
                     withContext(Dispatchers.Main) {
                         tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
                     }
@@ -212,8 +172,8 @@ class MainActivity : AppCompatActivity() {
                     tvStatus.text = "状态: 导出成功！文件已保存在：Download/$exportFileName"
                     Toast.makeText(this@MainActivity, "保存成功，请去手机『下载/Download』文件夹查看", Toast.LENGTH_LONG).show()
                 } else {
-                    tvStatus.text = "状态: 导出失败（可能因某特定类卡死或崩溃）"
-                    Toast.makeText(this@MainActivity, "写入文件失败", Toast.LENGTH_SHORT).show()
+                    tvStatus.text = "状态: 导出失败"
+                    Toast.makeText(this@MainActivity, "写入文件失败，请查看日志", Toast.LENGTH_SHORT).show()
                 }
             } else {
                 tvStatus.text = "状态: 无法在 Download 创建文件"
@@ -243,118 +203,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             e.printStackTrace()
             null
-        }
-    }
-
-    private suspend fun doStreamingDecompile(
-        inputFile: File, 
-        outputStream: OutputStream,
-        filterSdk: Boolean,
-        onProgress: suspend (current: Int, total: Int, className: String) -> Unit
-    ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            outputStream.bufferedWriter().use { writer ->
-                
-                // 核心修复 1：定义一个动态生成干净 JadxArgs 和 JadxDecompiler 实例的工厂函数，
-                // 彻底解决之前由于 args 状态被复用清理导致第二次 decompiler 启动崩溃的 Bug。
-                val createFreshDecompiler = {
-                    val freshArgs = JadxArgs().apply {
-                        inputFiles = listOf(inputFile)
-                        isSkipResources = true
-                    }
-                    JadxDecompiler(freshArgs)
-                }
-
-                // 1. 采用干净实例获取总类列表并进行过滤
-                var totalClassesCount = 0
-                val classesToDecompile = ArrayList<String>()
-
-                createFreshDecompiler().use { decompiler ->
-                    decompiler.load()
-                    val rawClasses = decompiler.classes
-                    totalClassesCount = rawClasses.size
-                    
-                    for (cls in rawClasses) {
-                        if (!filterSdk || !shouldFilter(cls.fullName)) {
-                            classesToDecompile.add(cls.fullName)
-                        }
-                    }
-                }
-
-                writer.write("// ==========================================\n")
-                writer.write("//  JADX 手机版 自动生成 (极致安全容灾版)\n")
-                writer.write("//  源文件: $currentFileName\n")
-                writer.write("//  总类数: $totalClassesCount\n")
-                writer.write("//  实际导出类数(已过滤SDK): ${classesToDecompile.size}\n")
-                writer.write("// ==========================================\n\n")
-                
-                var lastUpdateTime = 0L
-                val runtime = Runtime.getRuntime()
-                
-                val BATCH_SIZE = 300 
-                var classIndex = 0
-                val totalExportCount = classesToDecompile.size
-
-                while (classIndex < totalExportCount) {
-                    yield() 
-                    
-                    Log.d(TAG, "===> 正在创建全新 JADX 实例，当前索引: $classIndex")
-                    
-                    // 核心修复 1：使用干净工厂方法创建实例
-                    createFreshDecompiler().use { decompiler ->
-                        decompiler.load()
-                        
-                        val classesMap = decompiler.classes.associateBy { it.fullName }
-                        val batchEnd = minOf(classIndex + BATCH_SIZE, totalExportCount)
-                        
-                        for (i in classIndex until batchEnd) {
-                            val clsName = classesToDecompile[i]
-                            val cls = classesMap[clsName]
-                            val currentCount = i + 1
-                            
-                            if (cls != null) {
-                                val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
-                                Log.i(TAG, "[$currentCount/$totalExportCount] 正在解析: ${cls.fullName} | 当前堆已用: ${usedMemory}MB")
-                                
-                                writer.write("// [类 $currentCount/$totalExportCount] 类名: ${cls.fullName}\n")
-                                
-                                // 核心修复 2：针对每一个单独类的反编译动作进行 try-catch 隔离，
-                                // 确保即使某个畸形混淆类导致 JADX 反编译崩溃抛出异常，整个文件流也不会中断，依然会继续解析下一个类！
-                                try {
-                                    val code = cls.code
-                                    writer.write(code)
-                                } catch (e: Throwable) {
-                                    Log.e(TAG, "类 ${cls.fullName} 解析发生致命异常（已跳过此类的反编译代码输出）: ${e.localizedMessage}")
-                                    writer.write("// !!! 警告：该类反编译失败 (已自动跳过) !!!\n")
-                                    writer.write("// 错误异常类型: ${e.javaClass.simpleName}\n")
-                                    writer.write("// 错误日志信息: ${e.localizedMessage}\n")
-                                }
-                                
-                                writer.write("\n\n// ------------------------------------------\n\n")
-                                cls.unload() 
-                            }
-                            
-                            val currentTime = System.currentTimeMillis()
-                            if (currentTime - lastUpdateTime > 500 || currentCount == totalExportCount) {
-                                lastUpdateTime = currentTime
-                                onProgress(currentCount, totalExportCount, clsName)
-                            }
-                            
-                            yield()
-                        }
-                        classIndex = batchEnd
-                    } 
-
-                    System.gc()
-                    Log.d(TAG, "===> 主动垃圾回收成功。当前堆已用: ${(runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)}MB")
-                }
-                writer.flush()
-            }
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "导出过程中发生致命异常: ${e.localizedMessage}")
-            e.printStackTrace()
-            false
         }
     }
 }
