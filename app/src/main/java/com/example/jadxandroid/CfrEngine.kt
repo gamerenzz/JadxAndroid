@@ -44,13 +44,15 @@ class CfrEngine(
         try {
             val ext = file.name.substringAfterLast(".").lowercase()
             if (ext == "class") {
-                val code = decompileSingleClass(file)
+                val code = decompileSingleClass(file, null)
                 sb.append("// 成功解析 1 个类\n\n")
                 sb.append(code)
             } else { // jar 或 zip
                 ZipFile(file).use { zip ->
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
+                        // 核心增强 2：过滤掉所有带 $ 符号的匿名内部类/成员内部类，因为它们会被自动合并到主类中
+                        .filter { !it.name.contains("$") }
                         .filter { !filterSdk || !shouldFilter(it.name.replace('/', '.')) }
                         .toList()
 
@@ -71,7 +73,8 @@ class CfrEngine(
                             }
                         }
 
-                        val code = decompileSingleClass(tempClassFile)
+                        // 将整个 zip 文件作为类路径（Classpath）传入，供 CFR 查找内部类上下文
+                        val code = decompileSingleClass(tempClassFile, file)
                         tempClassFile.delete()
 
                         sb.append("// 类名: ${entry.name.replace('/', '.').substringBeforeLast(".class")}\n")
@@ -113,12 +116,14 @@ class CfrEngine(
                     onProgress(1, 1, className)
                     
                     writer.write("// 类名: $className\n")
-                    writer.write(decompileSingleClass(file))
+                    writer.write(decompileSingleClass(file, null))
                     writer.flush()
                 } else { // jar 或 zip
                     ZipFile(file).use { zip ->
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
+                            // 核心增强 2：过滤内部类
+                            .filter { !it.name.contains("$") }
                             .filter { !filterSdk || !shouldFilter(it.name.replace('/', '.')) }
                             .toList()
 
@@ -146,7 +151,8 @@ class CfrEngine(
                                     }
                                 }
 
-                                val code = decompileSingleClass(tempClassFile)
+                                // 传入 zip 文件路径作为 Classpath
+                                val code = decompileSingleClass(tempClassFile, file)
                                 tempClassFile.delete()
 
                                 writer.write(code)
@@ -176,8 +182,8 @@ class CfrEngine(
         }
     }
 
-    // 调用 CFR 原生 API 进行纯内存形式的快速单类反编译
-    private fun decompileSingleClass(classFile: File): String {
+    // 核心重构：支持传入 classpath 归档文件
+    private fun decompileSingleClass(classFile: File, classpathFile: File?): String {
         val sb = StringBuilder()
         val sinkFactory = object : OutputSinkFactory {
             
@@ -194,18 +200,21 @@ class CfrEngine(
             ): OutputSinkFactory.Sink<T>? {
                 return OutputSinkFactory.Sink { obj ->
                     if (obj != null) {
-                        try {
-                            // 核心修复 1：利用反射，动态提取 CFR 返回的 Decompiled 结构体中的 getJava() 真实源码
-                            val method = obj.javaClass.getMethod("getJava")
-                            val javaCode = method.invoke(obj) as? String
-                            if (javaCode != null) {
-                                sb.append(javaCode)
-                            } else {
-                                sb.append(obj.toString())
+                        if (obj is String) {
+                            // 核心增强 3：干净清洗，过滤掉 CFR 自动输出的 "Analysing type ..." 干扰性进度日志
+                            if (!obj.startsWith("Analysing type")) {
+                                sb.append(obj)
                             }
-                        } catch (e: Exception) {
-                            // 如果反射失败（或者返回的是普通 String），退化为普通 toString 保证兼容性
-                            sb.append(obj.toString())
+                        } else {
+                            try {
+                                val method = obj.javaClass.getMethod("getJava")
+                                val javaCode = method.invoke(obj) as? String
+                                if (javaCode != null) {
+                                    sb.append(javaCode)
+                                }
+                            } catch (e: Exception) {
+                                // 忽略非源码对象
+                            }
                         }
                     }
                 }
@@ -213,7 +222,13 @@ class CfrEngine(
         }
 
         val options = HashMap<String, String>()
-        options["showversion"] = "false" // 移除 CFR 版本号输出
+        options["showversion"] = "false" 
+        
+        // 核心增强 1：如果存在外部归档文件（如 ZIP 包），将其挂载为 CFR 的附加类路径
+        if (classpathFile != null && classpathFile.exists()) {
+            options["extraclasspath"] = classpathFile.absolutePath
+        }
+
         val driver = CfrDriver.Builder()
             .withOptions(options)
             .withOutputSink(sinkFactory)
