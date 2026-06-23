@@ -18,6 +18,19 @@ class CfrEngine(
 ) : DecompilerEngine {
 
     private val TAG = "CfrEngine"
+    private var libsDir: File? = null
+
+    init {
+        // 核心初始化：自动创建免权限依赖库文件夹 "libs"
+        try {
+            libsDir = context.getExternalFilesDir("libs")
+            if (libsDir != null && !libsDir!!.exists()) {
+                libsDir!!.mkdirs()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
 
     override fun getName(): String = "CFR"
 
@@ -35,6 +48,26 @@ class CfrEngine(
                className.startsWith("kotlinx.")                   
     }
 
+    // 智能依赖诊断：判断反编译出来的代码是否包含“缺失依赖”的特征注释
+    private fun checkDependencyMissing(code: String): Boolean {
+        return code.contains("Could not load the following classes:")
+    }
+
+    // 生成智能诊断提示横幅
+    private fun getDiagnosisBanner(): String {
+        val path = libsDir?.absolutePath ?: "内部存储/Android/data/com.example.jadxandroid/files/libs"
+        return """
+            // 💡 [大内密探智能依赖诊断助手]
+            // --------------------------------------------------------------------------
+            // 探测报告：微臣发现此代码中包含未解析的外部类。这会导致类型推导退化或部分合并失效。
+            // 增强建议：您可以将此项目依赖的 SDK 或是公共类库（.jar / .class 文件）放入手机以下目录：
+            // 📁 $path
+            // 放入后重新反编译，CFR 引擎将自动读取并进行高精度类型推导。
+            // --------------------------------------------------------------------------
+            
+        """.trimIndent()
+    }
+
     override suspend fun decompilePreview(file: File, filterSdk: Boolean): String = withContext(Dispatchers.IO) {
         if (isApkOrDex(file)) {
             return@withContext "CFR 引擎仅支持标准 Java .class 或 .jar/.zip 文件。\n安卓 .apk/.dex 请切换至 JADX 引擎解析。"
@@ -45,13 +78,18 @@ class CfrEngine(
             val ext = file.name.substringAfterLast(".").lowercase()
             if (ext == "class") {
                 val code = decompileSingleClass(file, null)
+                
+                // 如果检测到缺失依赖，在预览顶部插入智能诊断小助手
+                if (checkDependencyMissing(code)) {
+                    sb.append(getDiagnosisBanner())
+                }
+                
                 sb.append("// 成功解析 1 个类\n\n")
                 sb.append(code)
             } else { // jar 或 zip
                 ZipFile(file).use { zip ->
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
-                        // 核心增强 2：过滤掉所有带 $ 符号的匿名内部类/成员内部类，因为它们会被自动合并到主类中
                         .filter { !it.name.contains("$") }
                         .filter { !filterSdk || !shouldFilter(it.name.replace('/', '.')) }
                         .toList()
@@ -73,9 +111,13 @@ class CfrEngine(
                             }
                         }
 
-                        // 将整个 zip 文件作为类路径（Classpath）传入，供 CFR 查找内部类上下文
                         val code = decompileSingleClass(tempClassFile, file)
                         tempClassFile.delete()
+
+                        // 预览的第一个类如果缺失依赖，也打印诊断助手
+                        if (i == 0 && checkDependencyMissing(code)) {
+                            sb.append(getDiagnosisBanner())
+                        }
 
                         sb.append("// 类名: ${entry.name.replace('/', '.').substringBeforeLast(".class")}\n")
                         sb.append(code)
@@ -108,6 +150,12 @@ class CfrEngine(
                 val ext = file.name.substringAfterLast(".").lowercase()
                 if (ext == "class") {
                     val className = file.name.substringBeforeLast(".class")
+                    
+                    val code = decompileSingleClass(file, null)
+                    if (checkDependencyMissing(code)) {
+                        writer.write(getDiagnosisBanner())
+                    }
+                    
                     writer.write("// ==========================================\n")
                     writer.write("//  JADX 手机版 (CFR 引擎) 自动生成\n")
                     writer.write("//  源文件: $currentFileName\n")
@@ -116,16 +164,32 @@ class CfrEngine(
                     onProgress(1, 1, className)
                     
                     writer.write("// 类名: $className\n")
-                    writer.write(decompileSingleClass(file, null))
+                    writer.write(code)
                     writer.flush()
                 } else { // jar 或 zip
                     ZipFile(file).use { zip ->
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
-                            // 核心增强 2：过滤内部类
                             .filter { !it.name.contains("$") }
                             .filter { !filterSdk || !shouldFilter(it.name.replace('/', '.')) }
                             .toList()
+
+                        // 如果导出的第一个类检测到依赖缺失，在导出的 TXT 最顶部也附赠一份智能诊断说明
+                        if (entries.isNotEmpty()) {
+                            val firstEntry = entries[0]
+                            val tempClassFile = File(context.cacheDir, "TempFirst.class")
+                            if (tempClassFile.exists()) tempClassFile.delete()
+                            zip.getInputStream(firstEntry).use { input ->
+                                FileOutputStream(tempClassFile).use { output ->
+                                    input.copyTo(output)
+                                }
+                            }
+                            val checkCode = decompileSingleClass(tempClassFile, file)
+                            tempClassFile.delete()
+                            if (checkDependencyMissing(checkCode)) {
+                                writer.write(getDiagnosisBanner())
+                            }
+                        }
 
                         writer.write("// ==========================================\n")
                         writer.write("//  JADX 手机版 (CFR 引擎) 自动生成\n")
@@ -151,7 +215,6 @@ class CfrEngine(
                                     }
                                 }
 
-                                // 传入 zip 文件路径作为 Classpath
                                 val code = decompileSingleClass(tempClassFile, file)
                                 tempClassFile.delete()
 
@@ -182,7 +245,6 @@ class CfrEngine(
         }
     }
 
-    // 核心重构：支持传入 classpath 归档文件
     private fun decompileSingleClass(classFile: File, classpathFile: File?): String {
         val sb = StringBuilder()
         val sinkFactory = object : OutputSinkFactory {
@@ -201,7 +263,6 @@ class CfrEngine(
                 return OutputSinkFactory.Sink { obj ->
                     if (obj != null) {
                         if (obj is String) {
-                            // 核心增强 3：干净清洗，过滤掉 CFR 自动输出的 "Analysing type ..." 干扰性进度日志
                             if (!obj.startsWith("Analysing type")) {
                                 sb.append(obj)
                             }
@@ -213,7 +274,7 @@ class CfrEngine(
                                     sb.append(javaCode)
                                 }
                             } catch (e: Exception) {
-                                // 忽略非源码对象
+                                // 忽略
                             }
                         }
                     }
@@ -224,9 +285,30 @@ class CfrEngine(
         val options = HashMap<String, String>()
         options["showversion"] = "false" 
         
-        // 核心增强 1：如果存在外部归档文件（如 ZIP 包），将其挂载为 CFR 的附加类路径
+        // 核心增强：构建并注入动态类路径（ClassPath）
+        val cpBuilder = StringBuilder()
+        
+        // A. 首先挂载当前正在反编译的 ZIP/JAR
         if (classpathFile != null && classpathFile.exists()) {
-            options["extraclasspath"] = classpathFile.absolutePath
+            cpBuilder.append(classpathFile.absolutePath)
+        }
+        
+        // B. 自动扫描 libs 文件夹下的所有第三方依赖 .jar 包并进行拼装挂载
+        val localLibs = libsDir?.listFiles { file -> 
+            file.isFile && file.name.endsWith(".jar", ignoreCase = true) 
+        }
+        if (!localLibs.isNullOrEmpty()) {
+            for (jar in localLibs) {
+                if (cpBuilder.isNotEmpty()) {
+                    cpBuilder.append(":") // 安卓底层（Linux核心）使用冒号作类路径分隔符
+                }
+                cpBuilder.append(jar.absolutePath)
+            }
+        }
+
+        if (cpBuilder.isNotEmpty()) {
+            options["extraclasspath"] = cpBuilder.toString()
+            Log.d(TAG, "已成功挂载 ClassPath: ${cpBuilder.toString()}")
         }
 
         val driver = CfrDriver.Builder()
