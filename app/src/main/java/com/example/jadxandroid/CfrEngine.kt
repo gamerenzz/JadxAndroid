@@ -181,7 +181,6 @@ class CfrEngine(
         val sb = StringBuilder()
         val sinkFactory = object : OutputSinkFactory {
             
-            // 核心修复 1：覆写符合 CFR 0.152 标准的 getSupportedSinks 方法
             override fun getSupportedSinks(
                 sinkType: OutputSinkFactory.SinkType?, 
                 available: MutableCollection<OutputSinkFactory.SinkClass>?
@@ -189,13 +188,26 @@ class CfrEngine(
                 return listOf(OutputSinkFactory.SinkClass.DECOMPILED)
             }
 
-            // 核心修复 2：覆写 getSink 方法
             override fun <T> getSink(
                 sinkType: OutputSinkFactory.SinkType?, 
                 sinkClass: OutputSinkFactory.SinkClass?
             ): OutputSinkFactory.Sink<T>? {
                 return OutputSinkFactory.Sink { obj ->
-                    sb.append(obj)
+                    if (obj != null) {
+                        try {
+                            // 核心修复 1：利用反射，动态提取 CFR 返回的 Decompiled 结构体中的 getJava() 真实源码
+                            val method = obj.javaClass.getMethod("getJava")
+                            val javaCode = method.invoke(obj) as? String
+                            if (javaCode != null) {
+                                sb.append(javaCode)
+                            } else {
+                                sb.append(obj.toString())
+                            }
+                        } catch (e: Exception) {
+                            // 如果反射失败（或者返回的是普通 String），退化为普通 toString 保证兼容性
+                            sb.append(obj.toString())
+                        }
+                    }
                 }
             }
         }
