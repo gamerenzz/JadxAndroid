@@ -48,18 +48,14 @@ class CfrEngine(
                className.startsWith("kotlinx.")                   
     }
 
-    // 核心新增：兼容 Windows 压缩包，自动采用 GBK 编码读取，防止中文路径乱码
     private fun openZipFile(file: File): ZipFile {
         return try {
-            // Windows 中文压缩包一般使用 GBK 编码
             ZipFile(file, Charset.forName("GBK"))
         } catch (e: Exception) {
-            // 失败则降级使用标准 UTF-8
             ZipFile(file, Charset.forName("UTF-8"))
         }
     }
 
-    // 核心新增：从 CFR 报错注释中动态提取出真正缺失的第三方类名
     private fun extractMissingClasses(code: String): List<String> {
         val list = ArrayList<String>()
         val marker = "Could not load the following classes:"
@@ -71,7 +67,6 @@ class CfrEngine(
                 val linesSection = code.substring(start, end)
                 linesSection.lines().forEach { line ->
                     val trimmed = line.trim().trim('*').trim()
-                    // 过滤掉基础 Java 系统标准类（java./javax.），聚焦于真正缺失的第三方业务依赖包
                     if (trimmed.isNotEmpty() && 
                         !trimmed.startsWith("java.") && 
                         !trimmed.startsWith("javax.") && 
@@ -86,7 +81,7 @@ class CfrEngine(
         return list
     }
 
-    // 核心增强：生成包含具体“缺失类名清单”的智能诊断提示
+    // 优化 1：去除限制，完美、全量列出所有检测到缺失的类名
     private fun getDiagnosisBanner(missingClasses: List<String>): String {
         val path = libsDir?.absolutePath ?: "内部存储/Android/data/com.example.jadxandroid/files/libs"
         val sb = StringBuilder()
@@ -96,13 +91,9 @@ class CfrEngine(
         
         if (missingClasses.isNotEmpty()) {
             sb.append("// 🔍 检查到当前缺失的第三方核心包/类（请在依赖包中查找包含以下类的 JAR 并放入手机）：\n")
-            // 最多列出 8 个，避免诊断信息过长
-            val limit = minOf(missingClasses.size, 8)
-            for (i in 0 until limit) {
-                sb.append("//    📌 ${missingClasses[i]}\n")
-            }
-            if (missingClasses.size > limit) {
-                sb.append("//    ... 还有 ${missingClasses.size - limit} 个类未完全列出 ...\n")
+            // 循环遍历，全量列出所有缺失的外部类
+            for (missingCls in missingClasses) {
+                sb.append("//    📌 $missingCls\n")
             }
         }
         
@@ -165,7 +156,6 @@ class CfrEngine(
                             }
                         }
 
-                        // entry.name 经过 GBK 解码后，现在能完美显示中文包名和路径名了！
                         sb.append("// 类名: ${entry.name.replace('/', '.').substringBeforeLast(".class")}\n")
                         sb.append(code)
                         sb.append("\n\n// ==========================================\n\n")
@@ -188,12 +178,14 @@ class CfrEngine(
         filterSdk: Boolean,
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
-        if (isApkOrDex(file)) {
-            return@withContext false
-        }
-
         try {
-            outputStream.bufferedWriter().use { writer ->
+            // 优化 2：强制指定使用 UTF-8 字符集进行流式写入
+            outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                
+                // 核心修复：写入标准 UTF-8 BOM 字符 (\uFEFF)
+                // 这样能强迫手机端、电脑端所有的文本编辑器自动以标准的 UTF-8 编码格式无乱码打开
+                writer.write("\uFEFF")
+
                 val ext = file.name.substringAfterLast(".").lowercase()
                 if (ext == "class") {
                     val className = file.name.substringBeforeLast(".class")
