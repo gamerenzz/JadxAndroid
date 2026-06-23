@@ -81,7 +81,6 @@ class CfrEngine(
         return list
     }
 
-    // 优化 1：去除限制，完美、全量列出所有检测到缺失的类名
     private fun getDiagnosisBanner(missingClasses: List<String>): String {
         val path = libsDir?.absolutePath ?: "内部存储/Android/data/com.example.jadxandroid/files/libs"
         val sb = StringBuilder()
@@ -91,7 +90,6 @@ class CfrEngine(
         
         if (missingClasses.isNotEmpty()) {
             sb.append("// 🔍 检查到当前缺失的第三方核心包/类（请在依赖包中查找包含以下类的 JAR 并放入手机）：\n")
-            // 循环遍历，全量列出所有缺失的外部类
             for (missingCls in missingClasses) {
                 sb.append("//    📌 $missingCls\n")
             }
@@ -179,13 +177,13 @@ class CfrEngine(
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            // 优化 2：强制指定使用 UTF-8 字符集进行流式写入
-            outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
-                
-                // 核心修复：写入标准 UTF-8 BOM 字符 (\uFEFF)
-                // 这样能强迫手机端、电脑端所有的文本编辑器自动以标准的 UTF-8 编码格式无乱码打开
-                writer.write("\uFEFF")
+            // 核心修复 2：绕过 JVM 字符流转换器干扰，直接向最底层字节流写入标准 UTF-8 BOM 原始三字节
+            // 对应 16 进制为 EF BB BF
+            outputStream.write(0xEF)
+            outputStream.write(0xBB)
+            outputStream.write(0xBF)
 
+            outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
                 val ext = file.name.substringAfterLast(".").lowercase()
                 if (ext == "class") {
                     val className = file.name.substringBeforeLast(".class")
