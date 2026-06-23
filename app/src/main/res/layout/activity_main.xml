@@ -5,7 +5,7 @@
     android:orientation="vertical"
     android:padding="16dp">
 
-    <!-- 按钮并排 -->
+    <!-- 顶栏：按钮并排 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -28,14 +28,29 @@
             android:enabled="false" />
     </LinearLayout>
 
-    <!-- 新增：过滤 SDK 的复选框（默认勾选） -->
-    <CheckBox
-        android:id="@+id/cb_filter_sdk"
-        android:layout_width="wrap_content"
+    <!-- 工具栏：过滤SDK复选框 与 引擎选择下拉菜单横向并排 -->
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="过滤SDK (跳过谷歌/AndroidX/Kotlin等)"
-        android:checked="true" />
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginTop="4dp">
+        
+        <CheckBox
+            android:id="@+id/cb_filter_sdk"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:text="过滤SDK (跳过谷歌/系统等)"
+            android:checked="true" />
+
+        <Spinner
+            android:id="@+id/sp_engine"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="0.8"
+            android:spinnerMode="dropdown" />
+    </LinearLayout>
 
     <TextView
         android:id="@+id/tv_status"
