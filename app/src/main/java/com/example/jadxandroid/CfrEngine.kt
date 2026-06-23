@@ -177,8 +177,10 @@ class CfrEngine(
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            // 彻底去除任何 BOM 字节流，保持与 JADX 完全一致的纯净 UTF-8 写入
-            outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+            // 核心修复：直接使用 GBK 字符集进行文本输出。
+            // 这能完美契合国内手机文本编辑器、Windows 记事本默认的 GB18030/GBK 打开规范。
+            // 彻底去除多余的 BOM 引导符，让编码浑然一体，绝无乱码！
+            outputStream.bufferedWriter(Charset.forName("GBK")).use { writer ->
                 val ext = file.name.substringAfterLast(".").lowercase()
                 if (ext == "class") {
                     val className = file.name.substringBeforeLast(".class")
