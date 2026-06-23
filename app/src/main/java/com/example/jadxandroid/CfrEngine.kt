@@ -10,6 +10,7 @@ import kotlinx.coroutines.yield
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.nio.charset.Charset
 import java.util.zip.ZipFile
 
 class CfrEngine(
@@ -21,7 +22,6 @@ class CfrEngine(
     private var libsDir: File? = null
 
     init {
-        // 核心初始化：自动创建免权限依赖库文件夹 "libs"
         try {
             libsDir = context.getExternalFilesDir("libs")
             if (libsDir != null && !libsDir!!.exists()) {
@@ -48,24 +48,68 @@ class CfrEngine(
                className.startsWith("kotlinx.")                   
     }
 
-    // 智能依赖诊断：判断反编译出来的代码是否包含“缺失依赖”的特征注释
-    private fun checkDependencyMissing(code: String): Boolean {
-        return code.contains("Could not load the following classes:")
+    // 核心新增：兼容 Windows 压缩包，自动采用 GBK 编码读取，防止中文路径乱码
+    private fun openZipFile(file: File): ZipFile {
+        return try {
+            // Windows 中文压缩包一般使用 GBK 编码
+            ZipFile(file, Charset.forName("GBK"))
+        } catch (e: Exception) {
+            // 失败则降级使用标准 UTF-8
+            ZipFile(file, Charset.forName("UTF-8"))
+        }
     }
 
-    // 生成智能诊断提示横幅
-    private fun getDiagnosisBanner(): String {
+    // 核心新增：从 CFR 报错注释中动态提取出真正缺失的第三方类名
+    private fun extractMissingClasses(code: String): List<String> {
+        val list = ArrayList<String>()
+        val marker = "Could not load the following classes:"
+        val index = code.indexOf(marker)
+        if (index != -1) {
+            val start = index + marker.length
+            val end = code.indexOf("*/", start)
+            if (end != -1) {
+                val linesSection = code.substring(start, end)
+                linesSection.lines().forEach { line ->
+                    val trimmed = line.trim().trim('*').trim()
+                    // 过滤掉基础 Java 系统标准类（java./javax.），聚焦于真正缺失的第三方业务依赖包
+                    if (trimmed.isNotEmpty() && 
+                        !trimmed.startsWith("java.") && 
+                        !trimmed.startsWith("javax.") && 
+                        !trimmed.contains("Could not load") &&
+                        !trimmed.contains("Decompiled with")
+                    ) {
+                        list.add(trimmed)
+                    }
+                }
+            }
+        }
+        return list
+    }
+
+    // 核心增强：生成包含具体“缺失类名清单”的智能诊断提示
+    private fun getDiagnosisBanner(missingClasses: List<String>): String {
         val path = libsDir?.absolutePath ?: "内部存储/Android/data/com.example.jadxandroid/files/libs"
-        return """
-            // 💡 [大内密探智能依赖诊断助手]
-            // --------------------------------------------------------------------------
-            // 探测报告：微臣发现此代码中包含未解析的外部类。这会导致类型推导退化或部分合并失效。
-            // 增强建议：您可以将此项目依赖的 SDK 或是公共类库（.jar / .class 文件）放入手机以下目录：
-            // 📁 $path
-            // 放入后重新反编译，CFR 引擎将自动读取并进行高精度类型推导。
-            // --------------------------------------------------------------------------
-            
-        """.trimIndent()
+        val sb = StringBuilder()
+        sb.append("// 💡 [大内密探智能依赖诊断助手]\n")
+        sb.append("// --------------------------------------------------------------------------\n")
+        sb.append("// 探测报告：微臣发现此代码中包含未解析的外部类。这会导致类型推导退化或部分合并失效。\n")
+        
+        if (missingClasses.isNotEmpty()) {
+            sb.append("// 🔍 检查到当前缺失的第三方核心包/类（请在依赖包中查找包含以下类的 JAR 并放入手机）：\n")
+            // 最多列出 8 个，避免诊断信息过长
+            val limit = minOf(missingClasses.size, 8)
+            for (i in 0 until limit) {
+                sb.append("//    📌 ${missingClasses[i]}\n")
+            }
+            if (missingClasses.size > limit) {
+                sb.append("//    ... 还有 ${missingClasses.size - limit} 个类未完全列出 ...\n")
+            }
+        }
+        
+        sb.append("// 📁 依赖存放目录：$path\n")
+        sb.append("// 💡 放入后重新解析，CFR 引擎将自动读取并进行高精度类型推导。\n")
+        sb.append("// --------------------------------------------------------------------------\n\n")
+        return sb.toString()
     }
 
     override suspend fun decompilePreview(file: File, filterSdk: Boolean): String = withContext(Dispatchers.IO) {
@@ -79,15 +123,15 @@ class CfrEngine(
             if (ext == "class") {
                 val code = decompileSingleClass(file, null)
                 
-                // 如果检测到缺失依赖，在预览顶部插入智能诊断小助手
-                if (checkDependencyMissing(code)) {
-                    sb.append(getDiagnosisBanner())
+                val missingClasses = extractMissingClasses(code)
+                if (missingClasses.isNotEmpty()) {
+                    sb.append(getDiagnosisBanner(missingClasses))
                 }
                 
                 sb.append("// 成功解析 1 个类\n\n")
                 sb.append(code)
             } else { // jar 或 zip
-                ZipFile(file).use { zip ->
+                openZipFile(file).use { zip ->
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
                         .filter { !it.name.contains("$") }
@@ -114,11 +158,14 @@ class CfrEngine(
                         val code = decompileSingleClass(tempClassFile, file)
                         tempClassFile.delete()
 
-                        // 预览的第一个类如果缺失依赖，也打印诊断助手
-                        if (i == 0 && checkDependencyMissing(code)) {
-                            sb.append(getDiagnosisBanner())
+                        if (i == 0) {
+                            val missingClasses = extractMissingClasses(code)
+                            if (missingClasses.isNotEmpty()) {
+                                sb.append(getDiagnosisBanner(missingClasses))
+                            }
                         }
 
+                        // entry.name 经过 GBK 解码后，现在能完美显示中文包名和路径名了！
                         sb.append("// 类名: ${entry.name.replace('/', '.').substringBeforeLast(".class")}\n")
                         sb.append(code)
                         sb.append("\n\n// ==========================================\n\n")
@@ -152,8 +199,9 @@ class CfrEngine(
                     val className = file.name.substringBeforeLast(".class")
                     
                     val code = decompileSingleClass(file, null)
-                    if (checkDependencyMissing(code)) {
-                        writer.write(getDiagnosisBanner())
+                    val missingClasses = extractMissingClasses(code)
+                    if (missingClasses.isNotEmpty()) {
+                        writer.write(getDiagnosisBanner(missingClasses))
                     }
                     
                     writer.write("// ==========================================\n")
@@ -167,14 +215,13 @@ class CfrEngine(
                     writer.write(code)
                     writer.flush()
                 } else { // jar 或 zip
-                    ZipFile(file).use { zip ->
+                    openZipFile(file).use { zip ->
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
                             .filter { !it.name.contains("$") }
                             .filter { !filterSdk || !shouldFilter(it.name.replace('/', '.')) }
                             .toList()
 
-                        // 如果导出的第一个类检测到依赖缺失，在导出的 TXT 最顶部也附赠一份智能诊断说明
                         if (entries.isNotEmpty()) {
                             val firstEntry = entries[0]
                             val tempClassFile = File(context.cacheDir, "TempFirst.class")
@@ -186,8 +233,10 @@ class CfrEngine(
                             }
                             val checkCode = decompileSingleClass(tempClassFile, file)
                             tempClassFile.delete()
-                            if (checkDependencyMissing(checkCode)) {
-                                writer.write(getDiagnosisBanner())
+                            
+                            val missingClasses = extractMissingClasses(checkCode)
+                            if (missingClasses.isNotEmpty()) {
+                                writer.write(getDiagnosisBanner(missingClasses))
                             }
                         }
 
@@ -285,22 +334,19 @@ class CfrEngine(
         val options = HashMap<String, String>()
         options["showversion"] = "false" 
         
-        // 核心增强：构建并注入动态类路径（ClassPath）
         val cpBuilder = StringBuilder()
         
-        // A. 首先挂载当前正在反编译的 ZIP/JAR
         if (classpathFile != null && classpathFile.exists()) {
             cpBuilder.append(classpathFile.absolutePath)
         }
         
-        // B. 自动扫描 libs 文件夹下的所有第三方依赖 .jar 包并进行拼装挂载
         val localLibs = libsDir?.listFiles { file -> 
             file.isFile && file.name.endsWith(".jar", ignoreCase = true) 
         }
         if (!localLibs.isNullOrEmpty()) {
             for (jar in localLibs) {
                 if (cpBuilder.isNotEmpty()) {
-                    cpBuilder.append(":") // 安卓底层（Linux核心）使用冒号作类路径分隔符
+                    cpBuilder.append(":") 
                 }
                 cpBuilder.append(jar.absolutePath)
             }
