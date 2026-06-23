@@ -37,10 +37,12 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
-    // JADX 1.4.7 核心包
+    // 核心修复 2：完整补齐 JADX 1.4.7 的核心与输入依赖，使其能够解析 class/dex/jar/zip/apk
     implementation 'io.github.skylot:jadx-core:1.4.7'
+    implementation 'io.github.skylot:jadx-dex-input:1.4.7'
+    implementation 'io.github.skylot:jadx-java-input:1.4.7'
 
-    // 核心引入：CFR 0.152 反编译引擎（纯 Java 实现，极度稳定轻量）
+    // CFR 0.152 反编译引擎
     implementation 'org.benf:cfr:0.152'
 
     // 异步协程支持
