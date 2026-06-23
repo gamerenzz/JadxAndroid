@@ -177,12 +177,7 @@ class CfrEngine(
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            // 核心修复 2：绕过 JVM 字符流转换器干扰，直接向最底层字节流写入标准 UTF-8 BOM 原始三字节
-            // 对应 16 进制为 EF BB BF
-            outputStream.write(0xEF)
-            outputStream.write(0xBB)
-            outputStream.write(0xBF)
-
+            // 彻底去除任何 BOM 字节流，保持与 JADX 完全一致的纯净 UTF-8 写入
             outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
                 val ext = file.name.substringAfterLast(".").lowercase()
                 if (ext == "class") {
