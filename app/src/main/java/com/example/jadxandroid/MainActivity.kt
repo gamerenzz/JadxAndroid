@@ -9,8 +9,12 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox 
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts 
@@ -28,13 +32,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSelectFile: Button
     private lateinit var btnSaveTxt: Button
     private lateinit var cbFilterSdk: CheckBox 
+    private lateinit var spEngine: Spinner // 绑定下拉选择器
     private lateinit var tvStatus: TextView
     private lateinit var tvCode: TextView
 
     private var currentPreparedFile: File? = null 
     private var currentFileName: String = ""       
 
-    // 默认启用 JADX 引擎，CFR 引擎随时待命
+    // 当前处于活动状态的反编译引擎
     private var activeEngine: DecompilerEngine = JadxEngine("")
 
     private val filePickerLauncher = registerForActivityResult(
@@ -54,8 +59,41 @@ class MainActivity : AppCompatActivity() {
         btnSelectFile = findViewById(R.id.btn_select_file)
         btnSaveTxt = findViewById(R.id.btn_save_txt)
         cbFilterSdk = findViewById(R.id.cb_filter_sdk) 
+        spEngine = findViewById(R.id.sp_engine)
         tvStatus = findViewById(R.id.tv_status)
         tvCode = findViewById(R.id.tv_code)
+
+        // 初始化下拉菜单数据源
+        val engineList = arrayOf("JADX (安卓)", "CFR (Java)")
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, engineList)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spEngine.adapter = adapter
+
+        // 下拉菜单切换事件监听
+        spEngine.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                // 根据当前选中的索引，实例化对应引擎
+                activeEngine = if (position == 1) {
+                    CfrEngine(this@MainActivity, currentFileName)
+                } else {
+                    JadxEngine(currentFileName)
+                }
+
+                // 核心：如果当前已经加载了文件，切换引擎时直接重新反编译刷新预览！
+                if (currentPreparedFile != null) {
+                    triggerDecompilePreview()
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        // 核心：当用户切换“过滤SDK”复选框时，也立即重新反编译，体验极佳
+        cbFilterSdk.setOnCheckedChangeListener { _, _ ->
+            if (currentPreparedFile != null) {
+                triggerDecompilePreview()
+            }
+        }
 
         btnSelectFile.setOnClickListener {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -85,25 +123,38 @@ class MainActivity : AppCompatActivity() {
             if (tempFile != null && tempFile.exists()) {
                 currentPreparedFile = tempFile
                 
-                // 根据输入的文件类型，智能配置默认的反编译引擎！
-                // 如果是标准 Class/Jar 默认切换到极速 CFR，如果是 Apk/Dex 默认切换到 JADX
+                // 智能切换：根据文件类型，自动选择最佳默认引擎位置
+                // .apk/.dex 对应 0 (JADX), 其它对应 1 (CFR)
                 val ext = currentFileName.substringAfterLast(".").lowercase()
-                activeEngine = if (ext == "apk" || ext == "dex") {
-                    JadxEngine(currentFileName)
-                } else {
-                    CfrEngine(this@MainActivity, currentFileName)
-                }
+                val idealPosition = if (ext == "apk" || ext == "dex") 0 else 1
 
-                tvStatus.text = "状态: 正在反编译中 (引擎: ${activeEngine.getName()})..."
-                
-                val decompiledCode = activeEngine.decompilePreview(tempFile, cbFilterSdk.isChecked)
-                
-                tvStatus.text = "状态: 反编译完成 (引擎: ${activeEngine.getName()})"
-                tvCode.text = decompiledCode
-                btnSaveTxt.isEnabled = true 
+                if (spEngine.selectedItemPosition == idealPosition) {
+                    // 如果下拉菜单目前选中的已经是理想引擎，手动触发反编译
+                    triggerDecompilePreview()
+                } else {
+                    // 如果不一致，设置选择，将通过 onItemSelectedListener 自动触发反编译
+                    spEngine.setSelection(idealPosition)
+                }
             } else {
                 tvStatus.text = "状态: 复制文件失败"
             }
+        }
+    }
+
+    // 核心重构：统一的反编译预览执行入口
+    private fun triggerDecompilePreview() {
+        val tempFile = currentPreparedFile ?: return
+        if (!tempFile.exists()) return
+
+        tvStatus.text = "状态: 正在反编译中 (引擎: ${activeEngine.getName()})..."
+        tvCode.text = ""
+        btnSaveTxt.isEnabled = false
+
+        lifecycleScope.launch {
+            val decompiledCode = activeEngine.decompilePreview(tempFile, cbFilterSdk.isChecked)
+            tvStatus.text = "状态: 反编译完成 (引擎: ${activeEngine.getName()})"
+            tvCode.text = decompiledCode
+            btnSaveTxt.isEnabled = true
         }
     }
 
@@ -155,13 +206,12 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             val baseName = currentFileName.substringBeforeLast(".")
-            // 导出的文件名上带上当前的引擎标记
             val filterSuffix = if (cbFilterSdk.isChecked) "_filtered" else ""
             val exportFileName = "${baseName}${filterSuffix}_${activeEngine.getName().lowercase()}_decompiled.txt"
             
             val outputStream = getOutputStreamForDownload(exportFileName)
             if (outputStream != null) {
-                // 使用当前的 activeEngine 进行反编译
+                // 调用当前活动引擎执行完整的流式导出
                 val success = activeEngine.decompileAll(file, outputStream, cbFilterSdk.isChecked) { current, total, className ->
                     withContext(Dispatchers.Main) {
                         tvStatus.text = "状态: 正在导出... ($current / $total)\n当前解析: $className"
@@ -169,7 +219,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 
                 if (success) {
-                    tvStatus.text = "状态: 导出成功！文件已保存在：Download/$exportFileName"
+                    tvStatus.text = "状态: 导出成功！已保存在：Download/$exportFileName"
                     Toast.makeText(this@MainActivity, "保存成功，请去手机『下载/Download』文件夹查看", Toast.LENGTH_LONG).show()
                 } else {
                     tvStatus.text = "状态: 导出失败"
