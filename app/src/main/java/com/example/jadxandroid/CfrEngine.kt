@@ -39,27 +39,6 @@ class CfrEngine(
         return ext == "apk" || ext == "dex"
     }
 
-    private fun isThirdPartyLibrary(className: String): Boolean {
-        return className.startsWith("android.") ||
-               className.startsWith("androidx.") ||
-               className.startsWith("com.google.") ||
-               className.startsWith("kotlin.") ||
-               className.startsWith("kotlinx.") ||
-               className.startsWith("org.libsdl.") ||
-               className.startsWith("org.apache.") ||
-               className.startsWith("com.squareup.")
-    }
-
-    private fun shouldKeepClass(className: String, filterMode: FilterMode): Boolean {
-        // CFR 操作单个 .class 时，过滤掉匿名内部类文件能防止重复导出
-        if (className.contains("$")) return false
-
-        return when (filterMode) {
-            FilterMode.ALL -> true
-            FilterMode.FILTER_THIRDPARTY, FilterMode.APP_ONLY -> !isThirdPartyLibrary(className)
-        }
-    }
-
     private fun openZipFile(file: File): ZipFile {
         return try {
             ZipFile(file, Charset.forName("GBK"))
@@ -68,46 +47,21 @@ class CfrEngine(
         }
     }
 
-    private fun extractMissingClasses(code: String): List<String> {
-        val list = ArrayList<String>()
-        val marker = "Could not load the following classes:"
-        val index = code.indexOf(marker)
-        if (index != -1) {
-            val start = index + marker.length
-            val end = code.indexOf("*/", start)
-            if (end != -1) {
-                val linesSection = code.substring(start, end)
-                linesSection.lines().forEach { line ->
-                    val trimmed = line.trim().trim('*').trim()
-                    if (trimmed.isNotEmpty() && 
-                        !trimmed.startsWith("java.") && 
-                        !trimmed.startsWith("javax.") && 
-                        !trimmed.contains("Could not load") &&
-                        !trimmed.contains("Decompiled with")
-                    ) {
-                        list.add(trimmed)
-                    }
+    private fun inferPackageNameFromZip(entries: List<String>): String? {
+        val classNames = entries.map { it.replace('/', '.').substringBeforeLast(".class") }
+        val packageCounts = HashMap<String, Int>()
+
+        for (name in classNames) {
+            if (!FilterHelper.isResourceClass(name) && !FilterHelper.isThirdPartyLibrary(name)) {
+                val pkg = if (name.contains(".")) name.substringBeforeLast(".") else ""
+                if (pkg.isNotEmpty()) {
+                    packageCounts[pkg] = (packageCounts[pkg] ?: 0) + 1
                 }
             }
         }
-        return list
-    }
-
-    private fun getDiagnosisBanner(missingClasses: List<String>): String {
-        val path = libsDir?.absolutePath ?: "内部存储/Android/data/com.example.jadxandroid/files/libs"
-        val sb = StringBuilder()
-        sb.append("// 💡 [智能依赖诊断助手]\n")
-        sb.append("// --------------------------------------------------------------------------\n")
-        sb.append("// 探测报告：微臣发现此代码中包含未解析的外部类。\n")
-        if (missingClasses.isNotEmpty()) {
-            sb.append("// 🔍 检查到缺失的包/类：\n")
-            for (missingCls in missingClasses) {
-                sb.append("//    📌 $missingCls\n")
-            }
-        }
-        sb.append("// 📁 依赖存放目录：$path\n")
-        sb.append("// --------------------------------------------------------------------------\n")
-        return sb.toString()
+        val mostFrequent = packageCounts.maxByOrNull { it.value }?.key ?: return null
+        val parts = mostFrequent.split(".")
+        return if (parts.size >= 3) parts.take(3).joinToString(".") else mostFrequent
     }
 
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
@@ -120,25 +74,30 @@ class CfrEngine(
             val ext = file.name.substringAfterLast(".").lowercase()
             if (ext == "class") {
                 val code = decompileSingleClass(file, null)
-                val missingClasses = extractMissingClasses(code)
-                if (missingClasses.isNotEmpty()) {
-                    sb.append(getDiagnosisBanner(missingClasses))
-                    sb.append("\n")
-                }
                 sb.append("// 成功解析 1 个类\n\n")
                 sb.append(code)
             } else {
                 openZipFile(file).use { zip ->
+                    val allEntryNames = zip.entries().asSequence()
+                        .filter { !it.isDirectory && it.name.endsWith(".class") }
+                        .map { it.name }
+                        .toList()
+
+                    val appPackageName = inferPackageNameFromZip(allEntryNames)
+
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
-                        .filter { shouldKeepClass(it.name.replace('/', '.').substringBeforeLast(".class"), filterMode) }
+                        .filter { entry ->
+                            val className = entry.name.replace('/', '.').substringBeforeLast(".class")
+                            FilterHelper.shouldKeepClass(className, filterMode, appPackageName)
+                        }
                         .toList()
 
                     if (entries.isEmpty()) {
-                        return@withContext "未在文件中找到可解析的类（可能均被过滤器过滤）。"
+                        return@withContext "未在文件中找到符合当前过滤规则的类。"
                     }
 
-                    sb.append("// 成功解析，共找到 ${entries.size} 个类（当前模式: ${filterMode.displayName}）\n\n")
+                    sb.append("// 成功解析，保留 ${entries.size} 个类（模式: ${filterMode.displayName}）\n\n")
                     
                     val displayLimit = minOf(entries.size, 5)
                     for (i in 0 until displayLimit) {
@@ -185,15 +144,28 @@ class CfrEngine(
                     writer.flush()
                 } else {
                     openZipFile(file).use { zip ->
+                        val allEntryNames = zip.entries().asSequence()
+                            .filter { !it.isDirectory && it.name.endsWith(".class") }
+                            .map { it.name }
+                            .toList()
+
+                        val appPackageName = inferPackageNameFromZip(allEntryNames)
+
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
-                            .filter { shouldKeepClass(it.name.replace('/', '.').substringBeforeLast(".class"), filterMode) }
+                            .filter { entry ->
+                                val className = entry.name.replace('/', '.').substringBeforeLast(".class")
+                                FilterHelper.shouldKeepClass(className, filterMode, appPackageName)
+                            }
                             .toList()
 
                         writer.write("// ==========================================\n")
                         writer.write("//  JADX 手机版 (CFR 引擎) 自动生成\n")
                         writer.write("//  源文件: $currentFileName\n")
-                        writer.write("//  模式: ${filterMode.displayName}\n")
+                        if (!appPackageName.isNullOrEmpty()) {
+                            writer.write("//  应用主包名: $appPackageName\n")
+                        }
+                        writer.write("//  过滤模式: ${filterMode.displayName}\n")
                         writer.write("//  实际导出类数: ${entries.size}\n")
                         writer.write("// ==========================================\n\n")
 
