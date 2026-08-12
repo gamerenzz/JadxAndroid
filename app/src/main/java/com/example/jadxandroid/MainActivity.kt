@@ -35,7 +35,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSelectFile: Button
     private lateinit var btnSelectFolder: Button
     private lateinit var btnSaveTxt: Button
-    private lateinit var spFilterMode: Spinner // 替换为三级过滤 Spinner
+    private lateinit var spFilterMode: Spinner
     private lateinit var spEngine: Spinner
     private lateinit var tvStatus: TextView
     private lateinit var tvCode: TextView
@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
     private var currentPreparedFile: File? = null
     private var currentFileName: String = ""
 
-    private var activeEngine: DecompilerEngine = JadxEngine("")
+    private var activeEngine: DecompilerEngine = JadxEngine(this, "")
 
     private val filePickerLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -71,25 +71,24 @@ class MainActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tv_status)
         tvCode = findViewById(R.id.tv_code)
 
-        // 初始化引擎选择框
-        val engineList = arrayOf("JADX (安卓)", "CFR (Java)")
+        // 优化 UI 提示，清晰标记引擎适用场景
+        val engineList = arrayOf("JADX (安卓 APK/DEX 专属)", "CFR (Java Class/JAR 专属)")
         val engineAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, engineList)
         engineAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spEngine.adapter = engineAdapter
 
-        // 初始化过滤模式选择框
         val filterModes = FilterMode.values().map { it.displayName }.toTypedArray()
         val filterAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, filterModes)
         filterAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spFilterMode.adapter = filterAdapter
-        spFilterMode.setSelection(2) // 默认选中 "仅 App 主包 (⭐推荐)"
+        spFilterMode.setSelection(2) // 默认: 仅 App 主包 (⭐推荐)
 
         spEngine.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 activeEngine = if (position == 1) {
                     CfrEngine(this@MainActivity, currentFileName)
                 } else {
-                    JadxEngine(currentFileName)
+                    JadxEngine(this@MainActivity, currentFileName)
                 }
                 if (currentPreparedFile != null) triggerDecompilePreview()
             }
