@@ -3,9 +3,10 @@ package com.example.jadxandroid
 import android.util.Log
 import jadx.api.JadxArgs
 import jadx.api.JadxDecompiler
+import jadx.api.JavaClass
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.yield
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
 import java.io.OutputStream
 
@@ -15,47 +16,82 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
 
     override fun getName(): String = "JADX"
 
-    private fun shouldFilter(className: String): Boolean {
-        return className.startsWith("com.google.android.gms") || 
-               className.startsWith("com.google.firebase") ||    
-               className.startsWith("androidx.") ||               
-               className.startsWith("android.support") ||         
-               className.startsWith("kotlin.") ||                 
-               className.startsWith("kotlinx.")                   
+    // 广谱第三方库黑名单
+    private fun isThirdPartyLibrary(className: String): Boolean {
+        return className.startsWith("android.") ||
+               className.startsWith("androidx.") ||
+               className.startsWith("com.google.") ||
+               className.startsWith("kotlin.") ||
+               className.startsWith("kotlinx.") ||
+               className.startsWith("org.libsdl.") ||
+               className.startsWith("org.apache.") ||
+               className.startsWith("org.intellij.") ||
+               className.startsWith("org.jetbrains.") ||
+               className.startsWith("com.squareup.") ||
+               className.startsWith("io.reactivex.") ||
+               className.startsWith("com.bumptech.glide.") ||
+               className.startsWith("com.google.gson.") ||
+               className.startsWith("com.alibaba.") ||
+               className.startsWith("com.tencent.") && !className.contains("jy") // 避免误杀特定包
     }
 
-    override suspend fun decompilePreview(file: File, filterSdk: Boolean): String = withContext(Dispatchers.IO) {
+    private fun shouldKeepClass(cls: JavaClass, filterMode: FilterMode, appPackageName: String?): Boolean {
+        // JADX 中内部类（如 Outer$Inner）会被自动合并到外层主类代码中，不需要单独作为顶层类导出
+        if (cls.isInner) return false
+
+        val className = cls.fullName
+        return when (filterMode) {
+            FilterMode.ALL -> true
+            FilterMode.FILTER_THIRDPARTY -> !isThirdPartyLibrary(className)
+            FilterMode.APP_ONLY -> {
+                if (!appPackageName.isNullOrEmpty()) {
+                    className == appPackageName || className.startsWith("$appPackageName.")
+                } else {
+                    // 如果无法提取到包名（非 APK 文件），退化为过滤第三方库
+                    !isThirdPartyLibrary(className)
+                }
+            }
+        }
+    }
+
+    override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
         try {
             val args = JadxArgs().apply {
                 inputFiles = listOf(file)
-                isSkipResources = true 
+                isSkipResources = true
             }
 
             JadxDecompiler(args).use { decompiler ->
                 decompiler.load()
-                
+
+                val appPackageName = decompiler.manifestData?.packageName
                 val rawClasses = decompiler.classes
-                val filteredClasses = if (filterSdk) {
-                    rawClasses.filter { !shouldFilter(it.fullName) }
-                } else {
-                    rawClasses
-                }
+
+                val filteredClasses = rawClasses.filter { shouldKeepClass(it, filterMode, appPackageName) }
 
                 if (filteredClasses.isEmpty()) {
-                    return@withContext "未在文件中找到可解析的类（可能均被 SDK 过滤器过滤）。"
+                    return@withContext "未在文件中找到匹配当前过滤模式 [${filterMode.displayName}] 的类。"
                 }
-                
-                sb.append("// 成功解析，共找到 ${rawClasses.size} 个类（已过滤保留 ${filteredClasses.size} 个类）\n\n")
+
+                sb.append("// ==========================================\n")
+                sb.append("//  JADX 引擎反编译预览\n")
+                if (!appPackageName.isNullOrEmpty()) {
+                    sb.append("//  检测到 APK 主包名: $appPackageName\n")
+                }
+                sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
+                sb.append("//  原始类总数: ${rawClasses.size} | 过滤后保留: ${filteredClasses.size}\n")
+                sb.append("// ==========================================\n\n")
+
                 val displayLimit = minOf(filteredClasses.size, 5)
                 for (i in 0 until displayLimit) {
                     val cls = filteredClasses[i]
-                    sb.append("// 类名: ${cls.fullName}\n")
+                    sb.append("// [预览 ${i + 1}/$displayLimit] 类名: ${cls.fullName}\n")
                     sb.append(cls.code)
                     sb.append("\n\n// ==========================================\n\n")
                 }
                 if (filteredClasses.size > displayLimit) {
-                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未完全展示 ...")
+                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未完全展示，点击下方按钮导出完整 TXT ...")
                 }
             }
         } catch (e: Exception) {
@@ -68,12 +104,12 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
     override suspend fun decompileAll(
         file: File,
         outputStream: OutputStream,
-        filterSdk: Boolean,
+        filterMode: FilterMode,
         onProgress: suspend (current: Int, total: Int, className: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             outputStream.bufferedWriter().use { writer ->
-                
+
                 val createFreshDecompiler = {
                     val freshArgs = JadxArgs().apply {
                         inputFiles = listOf(file)
@@ -83,15 +119,18 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 }
 
                 var totalClassesCount = 0
+                var detectedPackageName: String? = null
                 val classesToDecompile = ArrayList<String>()
 
+                // 首次加载：读取 PackageName 并筛选出目标类名列表
                 createFreshDecompiler().use { decompiler ->
                     decompiler.load()
+                    detectedPackageName = decompiler.manifestData?.packageName
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
-                    
+
                     for (cls in rawClasses) {
-                        if (!filterSdk || !shouldFilter(cls.fullName)) {
+                        if (shouldKeepClass(cls, filterMode, detectedPackageName)) {
                             classesToDecompile.add(cls.fullName)
                         }
                     }
@@ -100,66 +139,63 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 writer.write("// ==========================================\n")
                 writer.write("//  JADX 手机版 (JADX 引擎) 自动生成\n")
                 writer.write("//  源文件: $currentFileName\n")
-                writer.write("//  总类数: $totalClassesCount\n")
-                writer.write("//  实际导出类数(已过滤SDK): ${classesToDecompile.size}\n")
+                if (!detectedPackageName.isNullOrEmpty()) {
+                    writer.write("//  APK 主包名: $detectedPackageName\n")
+                }
+                writer.write("//  过滤模式: ${filterMode.displayName}\n")
+                writer.write("//  原始类总数: $totalClassesCount\n")
+                writer.write("//  实际导出类数: ${classesToDecompile.size}\n")
                 writer.write("// ==========================================\n\n")
-                
+
                 var lastUpdateTime = 0L
                 val runtime = Runtime.getRuntime()
-                
-                val BATCH_SIZE = 300 
+
+                val BATCH_SIZE = 300
                 var classIndex = 0
                 val totalExportCount = classesToDecompile.size
 
                 while (classIndex < totalExportCount) {
-                    yield() 
-                    
-                    Log.d(TAG, "===> 正在创建全新 JADX 实例，当前索引: $classIndex")
-                    
+                    yield()
+
                     createFreshDecompiler().use { decompiler ->
                         decompiler.load()
-                        
+
                         val classesMap = decompiler.classes.associateBy { it.fullName }
                         val batchEnd = minOf(classIndex + BATCH_SIZE, totalExportCount)
-                        
+
                         for (i in classIndex until batchEnd) {
                             val clsName = classesToDecompile[i]
                             val cls = classesMap[clsName]
                             val currentCount = i + 1
-                            
+
                             if (cls != null) {
-                                val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
-                                Log.i(TAG, "[$currentCount/$totalExportCount] 正在解析: ${cls.fullName} | 当前堆已用: ${usedMemory}MB")
-                                
-                                writer.write("// [类 $currentCount/$totalExportCount] 类名: ${cls.fullName}\n")
-                                
+                                writer.write("// [$currentCount/$totalExportCount] 类名: ${cls.fullName}\n")
+
                                 try {
                                     val code = cls.code
                                     writer.write(code)
                                 } catch (e: Throwable) {
                                     Log.e(TAG, "类 ${cls.fullName} 解析发生异常: ${e.localizedMessage}")
                                     writer.write("// !!! 警告：该类反编译失败 (已自动跳过) !!!\n")
-                                    writer.write("// 错误异常类型: ${e.javaClass.simpleName}\n")
-                                    writer.write("// 错误日志信息: ${e.localizedMessage}\n")
+                                    writer.write("// 错误日志: ${e.localizedMessage}\n")
                                 }
-                                
+
                                 writer.write("\n\n// ------------------------------------------\n\n")
-                                cls.unload() 
+                                cls.unload()
                             }
-                            
+
                             val currentTime = System.currentTimeMillis()
                             if (currentTime - lastUpdateTime > 500 || currentCount == totalExportCount) {
                                 lastUpdateTime = currentTime
                                 onProgress(currentCount, totalExportCount, clsName)
                             }
-                            
+
                             yield()
                         }
                         classIndex = batchEnd
-                    } 
+                    }
 
                     System.gc()
-                    Log.d(TAG, "===> 主动垃圾回收成功。当前堆已用: ${(runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)}MB")
                 }
                 writer.flush()
             }
