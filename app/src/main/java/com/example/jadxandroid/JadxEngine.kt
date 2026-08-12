@@ -32,7 +32,40 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                className.startsWith("com.bumptech.glide.") ||
                className.startsWith("com.google.gson.") ||
                className.startsWith("com.alibaba.") ||
-               className.startsWith("com.tencent.") && !className.contains("jy") // 避免误杀特定包
+               (className.startsWith("com.tencent.") && !className.contains("jy"))
+    }
+
+    private fun getPackageName(fullName: String): String {
+        return if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
+    }
+
+    /**
+     * 核心智能算法：在不依赖 Manifest 的情况下，从类列表中推断出 APK 的主包名
+     * 适用于 APK、DEX、JAR 以及文件夹
+     */
+    private fun inferAppPackageName(classes: List<JavaClass>): String? {
+        val nonThirdPartyClasses = classes.filter { !it.isInner && !isThirdPartyLibrary(it.fullName) }
+        if (nonThirdPartyClasses.isEmpty()) return null
+
+        val packageCounts = HashMap<String, Int>()
+        for (cls in nonThirdPartyClasses) {
+            val pkg = getPackageName(cls.fullName)
+            if (pkg.isNotEmpty()) {
+                packageCounts[pkg] = (packageCounts[pkg] ?: 0) + 1
+            }
+        }
+        if (packageCounts.isEmpty()) return null
+
+        // 找到出现频次最高的完整包名
+        val mostFrequentPkg = packageCounts.maxByOrNull { it.value }?.key ?: return null
+        val parts = mostFrequentPkg.split(".")
+
+        // 截取前 3 级包名（如 com.wangwu.jymod52），作为主包匹配前缀
+        return if (parts.size >= 3) {
+            parts.take(3).joinToString(".")
+        } else {
+            mostFrequentPkg
+        }
     }
 
     private fun shouldKeepClass(cls: JavaClass, filterMode: FilterMode, appPackageName: String?): Boolean {
@@ -47,7 +80,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 if (!appPackageName.isNullOrEmpty()) {
                     className == appPackageName || className.startsWith("$appPackageName.")
                 } else {
-                    // 如果无法提取到包名（非 APK 文件），退化为过滤第三方库
+                    // 如果无法推断包名，退化为过滤第三方库
                     !isThirdPartyLibrary(className)
                 }
             }
@@ -65,8 +98,8 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
             JadxDecompiler(args).use { decompiler ->
                 decompiler.load()
 
-                val appPackageName = decompiler.manifestData?.packageName
                 val rawClasses = decompiler.classes
+                val appPackageName = inferAppPackageName(rawClasses)
 
                 val filteredClasses = rawClasses.filter { shouldKeepClass(it, filterMode, appPackageName) }
 
@@ -77,7 +110,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 sb.append("// ==========================================\n")
                 sb.append("//  JADX 引擎反编译预览\n")
                 if (!appPackageName.isNullOrEmpty()) {
-                    sb.append("//  检测到 APK 主包名: $appPackageName\n")
+                    sb.append("//  💡 自动推断应用主包名: $appPackageName\n")
                 }
                 sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
                 sb.append("//  原始类总数: ${rawClasses.size} | 过滤后保留: ${filteredClasses.size}\n")
@@ -122,12 +155,12 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 var detectedPackageName: String? = null
                 val classesToDecompile = ArrayList<String>()
 
-                // 首次加载：读取 PackageName 并筛选出目标类名列表
+                // 首次加载：智能推断 PackageName 并筛选出目标类名列表
                 createFreshDecompiler().use { decompiler ->
                     decompiler.load()
-                    detectedPackageName = decompiler.manifestData?.packageName
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
+                    detectedPackageName = inferAppPackageName(rawClasses)
 
                     for (cls in rawClasses) {
                         if (shouldKeepClass(cls, filterMode, detectedPackageName)) {
@@ -140,7 +173,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 writer.write("//  JADX 手机版 (JADX 引擎) 自动生成\n")
                 writer.write("//  源文件: $currentFileName\n")
                 if (!detectedPackageName.isNullOrEmpty()) {
-                    writer.write("//  APK 主包名: $detectedPackageName\n")
+                    writer.write("//  应用主包名: $detectedPackageName\n")
                 }
                 writer.write("//  过滤模式: ${filterMode.displayName}\n")
                 writer.write("//  原始类总数: $totalClassesCount\n")
@@ -148,8 +181,6 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 writer.write("// ==========================================\n\n")
 
                 var lastUpdateTime = 0L
-                val runtime = Runtime.getRuntime()
-
                 val BATCH_SIZE = 300
                 var classIndex = 0
                 val totalExportCount = classesToDecompile.size
