@@ -16,35 +16,17 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
 
     override fun getName(): String = "JADX"
 
-    // 广谱第三方库黑名单
-    private fun isThirdPartyLibrary(className: String): Boolean {
-        return className.startsWith("android.") ||
-               className.startsWith("androidx.") ||
-               className.startsWith("com.google.") ||
-               className.startsWith("kotlin.") ||
-               className.startsWith("kotlinx.") ||
-               className.startsWith("org.libsdl.") ||
-               className.startsWith("org.apache.") ||
-               className.startsWith("org.intellij.") ||
-               className.startsWith("org.jetbrains.") ||
-               className.startsWith("com.squareup.") ||
-               className.startsWith("io.reactivex.") ||
-               className.startsWith("com.bumptech.glide.") ||
-               className.startsWith("com.google.gson.") ||
-               className.startsWith("com.alibaba.") ||
-               (className.startsWith("com.tencent.") && !className.contains("jy"))
-    }
-
     private fun getPackageName(fullName: String): String {
         return if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
     }
 
     /**
-     * 核心智能算法：在不依赖 Manifest 的情况下，从类列表中推断出 APK 的主包名
-     * 适用于 APK、DEX、JAR 以及文件夹
+     * 从类列表中智能推断出 APK 的主包名
      */
     private fun inferAppPackageName(classes: List<JavaClass>): String? {
-        val nonThirdPartyClasses = classes.filter { !it.isInner && !isThirdPartyLibrary(it.fullName) }
+        val nonThirdPartyClasses = classes.filter { 
+            !FilterHelper.isResourceClass(it.fullName) && !FilterHelper.isThirdPartyLibrary(it.fullName) 
+        }
         if (nonThirdPartyClasses.isEmpty()) return null
 
         val packageCounts = HashMap<String, Int>()
@@ -56,11 +38,9 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
         }
         if (packageCounts.isEmpty()) return null
 
-        // 找到出现频次最高的完整包名
         val mostFrequentPkg = packageCounts.maxByOrNull { it.value }?.key ?: return null
         val parts = mostFrequentPkg.split(".")
 
-        // 截取前 3 级包名（如 com.wangwu.jymod52），作为主包匹配前缀
         return if (parts.size >= 3) {
             parts.take(3).joinToString(".")
         } else {
@@ -68,23 +48,11 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
         }
     }
 
-    private fun shouldKeepClass(cls: JavaClass, filterMode: FilterMode, appPackageName: String?): Boolean {
-        // JADX 中内部类（如 Outer$Inner）会被自动合并到外层主类代码中，不需要单独作为顶层类导出
+    private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appPackageName: String?): Boolean {
+        // JADX 中顶层主类解析时会自动嵌套其内部类代码；独立遍历时过滤 isInner 可避免重复代码打印
         if (cls.isInner) return false
 
-        val className = cls.fullName
-        return when (filterMode) {
-            FilterMode.ALL -> true
-            FilterMode.FILTER_THIRDPARTY -> !isThirdPartyLibrary(className)
-            FilterMode.APP_ONLY -> {
-                if (!appPackageName.isNullOrEmpty()) {
-                    className == appPackageName || className.startsWith("$appPackageName.")
-                } else {
-                    // 如果无法推断包名，退化为过滤第三方库
-                    !isThirdPartyLibrary(className)
-                }
-            }
-        }
+        return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appPackageName)
     }
 
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
@@ -101,7 +69,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 val rawClasses = decompiler.classes
                 val appPackageName = inferAppPackageName(rawClasses)
 
-                val filteredClasses = rawClasses.filter { shouldKeepClass(it, filterMode, appPackageName) }
+                val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appPackageName) }
 
                 if (filteredClasses.isEmpty()) {
                     return@withContext "未在文件中找到匹配当前过滤模式 [${filterMode.displayName}] 的类。"
@@ -110,7 +78,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 sb.append("// ==========================================\n")
                 sb.append("//  JADX 引擎反编译预览\n")
                 if (!appPackageName.isNullOrEmpty()) {
-                    sb.append("//  💡 自动推断应用主包名: $appPackageName\n")
+                    sb.append("//  💡 自动识别主包名: $appPackageName\n")
                 }
                 sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
                 sb.append("//  原始类总数: ${rawClasses.size} | 过滤后保留: ${filteredClasses.size}\n")
@@ -124,7 +92,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                     sb.append("\n\n// ==========================================\n\n")
                 }
                 if (filteredClasses.size > displayLimit) {
-                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未完全展示，点击下方按钮导出完整 TXT ...")
+                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未展示，点击保存导出完整 TXT ...")
                 }
             }
         } catch (e: Exception) {
@@ -155,7 +123,6 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 var detectedPackageName: String? = null
                 val classesToDecompile = ArrayList<String>()
 
-                // 首次加载：智能推断 PackageName 并筛选出目标类名列表
                 createFreshDecompiler().use { decompiler ->
                     decompiler.load()
                     val rawClasses = decompiler.classes
@@ -163,7 +130,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                     detectedPackageName = inferAppPackageName(rawClasses)
 
                     for (cls in rawClasses) {
-                        if (shouldKeepClass(cls, filterMode, detectedPackageName)) {
+                        if (shouldKeepJavaClass(cls, filterMode, detectedPackageName)) {
                             classesToDecompile.add(cls.fullName)
                         }
                     }
@@ -206,9 +173,9 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                                     val code = cls.code
                                     writer.write(code)
                                 } catch (e: Throwable) {
-                                    Log.e(TAG, "类 ${cls.fullName} 解析发生异常: ${e.localizedMessage}")
-                                    writer.write("// !!! 警告：该类反编译失败 (已自动跳过) !!!\n")
-                                    writer.write("// 错误日志: ${e.localizedMessage}\n")
+                                    Log.e(TAG, "类 ${cls.fullName} 解析异常: ${e.localizedMessage}")
+                                    writer.write("// !!! 警告：该类反编译失败 (已跳过) !!!\n")
+                                    writer.write("// 错误信息: ${e.localizedMessage}\n")
                                 }
 
                                 writer.write("\n\n// ------------------------------------------\n\n")
@@ -232,7 +199,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
             }
             true
         } catch (e: Exception) {
-            Log.e(TAG, "导出过程中发生致命错误: ${e.localizedMessage}")
+            Log.e(TAG, "导出致命错误: ${e.localizedMessage}")
             e.printStackTrace()
             false
         }
