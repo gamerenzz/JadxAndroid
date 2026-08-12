@@ -1,5 +1,6 @@
 package com.example.jadxandroid
 
+import android.content.Context
 import android.util.Log
 import jadx.api.JadxArgs
 import jadx.api.JadxDecompiler
@@ -10,7 +11,10 @@ import kotlinx.coroutines.yield
 import java.io.File
 import java.io.OutputStream
 
-class JadxEngine(private val currentFileName: String) : DecompilerEngine {
+class JadxEngine(
+    private val context: Context,
+    private val currentFileName: String
+) : DecompilerEngine {
 
     private val TAG = "JadxEngine"
 
@@ -21,9 +25,23 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
     }
 
     /**
-     * 从类列表中智能推断出 APK 的主包名
+     * 获取应用主包名 (双重保险机制)：
+     * 1. 优先调用 Android 系统原生 API 解析 APK Manifest (100% 准确)
+     * 2. 若为 DEX/JAR/ZIP 等无 Manifest 文件，退化为类频次统计推断
      */
-    private fun inferAppPackageName(classes: List<JavaClass>): String? {
+    private fun getAppPackageName(file: File, classes: List<JavaClass>): String? {
+        // 优先级 1：针对 APK，直接调用 Android 原生 API 获取真实 Manifest 包名
+        try {
+            val archiveInfo = context.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+            if (archiveInfo != null && !archiveInfo.packageName.isNullOrEmpty()) {
+                Log.d(TAG, "从 Android 原生 Manifest 成功获取包名: ${archiveInfo.packageName}")
+                return archiveInfo.packageName
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "无法通过原生 API 获取 Manifest: ${e.localizedMessage}")
+        }
+
+        // 优先级 2：保底方案 - 统计频次推断 (适用于 DEX/JAR/ZIP)
         val nonThirdPartyClasses = classes.filter { 
             !FilterHelper.isResourceClass(it.fullName) && !FilterHelper.isThirdPartyLibrary(it.fullName) 
         }
@@ -49,9 +67,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
     }
 
     private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appPackageName: String?): Boolean {
-        // JADX 中顶层主类解析时会自动嵌套其内部类代码；独立遍历时过滤 isInner 可避免重复代码打印
-        if (cls.isInner) return false
-
+        // 核心修改：不再全局剥离 isInner！保留如 JYmodActivity$1 等业务逻辑内部类，仅由 FilterHelper 剔除 R$ 资源类
         return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appPackageName)
     }
 
@@ -67,7 +83,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 decompiler.load()
 
                 val rawClasses = decompiler.classes
-                val appPackageName = inferAppPackageName(rawClasses)
+                val appPackageName = getAppPackageName(file, rawClasses)
 
                 val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appPackageName) }
 
@@ -78,7 +94,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                 sb.append("// ==========================================\n")
                 sb.append("//  JADX 引擎反编译预览\n")
                 if (!appPackageName.isNullOrEmpty()) {
-                    sb.append("//  💡 自动识别主包名: $appPackageName\n")
+                    sb.append("//  💡 识别应用主包名: $appPackageName\n")
                 }
                 sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
                 sb.append("//  原始类总数: ${rawClasses.size} | 过滤后保留: ${filteredClasses.size}\n")
@@ -127,7 +143,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                     decompiler.load()
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
-                    detectedPackageName = inferAppPackageName(rawClasses)
+                    detectedPackageName = getAppPackageName(file, rawClasses)
 
                     for (cls in rawClasses) {
                         if (shouldKeepJavaClass(cls, filterMode, detectedPackageName)) {
@@ -175,7 +191,7 @@ class JadxEngine(private val currentFileName: String) : DecompilerEngine {
                                 } catch (e: Throwable) {
                                     Log.e(TAG, "类 ${cls.fullName} 解析异常: ${e.localizedMessage}")
                                     writer.write("// !!! 警告：该类反编译失败 (已跳过) !!!\n")
-                                    writer.write("// 错误信息: ${e.localizedMessage}\n")
+                                    writer.write("// 错误日志: ${e.localizedMessage}\n")
                                 }
 
                                 writer.write("\n\n// ------------------------------------------\n\n")
