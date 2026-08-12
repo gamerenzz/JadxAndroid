@@ -39,7 +39,7 @@
             android:enabled="false" />
     </LinearLayout>
 
-    <!-- 工具栏：过滤SDK复选框 与 引擎选择下拉菜单横向并排 -->
+    <!-- 工具栏：过滤模式下拉菜单 与 引擎选择下拉菜单并排 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -47,13 +47,12 @@
         android:gravity="center_vertical"
         android:layout_marginTop="4dp">
         
-        <CheckBox
-            android:id="@+id/cb_filter_sdk"
+        <Spinner
+            android:id="@+id/sp_filter_mode"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1.2"
-            android:text="过滤SDK (跳过谷歌/系统等)"
-            android:checked="true" />
+            android:spinnerMode="dropdown" />
 
         <Spinner
             android:id="@+id/sp_engine"
