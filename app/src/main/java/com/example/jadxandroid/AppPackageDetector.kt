@@ -22,11 +22,24 @@ data class AppCodeAnalysisResult(
     val externalDeps: Set<String>,
     val rawClassesCount: Int = 0
 ) {
+    /**
+     * 核心解耦：仅获取真正属于 App 自有业务的代码包集合 (用于 APP_ONLY 模式)
+     * 排除第三方游戏引擎 (GAME_ENGINE) 和 第三方依赖库 (EXTERNAL_DEP)
+     */
+    fun getAppOwnedPackages(): Set<String> {
+        val appOwned = HashSet<String>()
+        appOwned.addAll(corePackages)
+        appOwned.addAll(modulePackages)
+        appOwned.addAll(nativeBridges) // Native 桥接层属于业务运行所必需
+        return appOwned
+    }
+
+    /**
+     * 获取所有可保留包 (包含第三方依赖，用于 FILTER_THIRDPARTY 模式)
+     */
     fun getAllAllowedPackages(): Set<String> {
         val all = HashSet<String>()
-        all.addAll(corePackages)
-        all.addAll(modulePackages)
-        all.addAll(nativeBridges)
+        all.addAll(getAppOwnedPackages())
         all.addAll(gameEngines)
         all.addAll(externalDeps)
         return all
@@ -62,7 +75,7 @@ object AppPackageDetector {
             if (archiveInfo != null) {
                 val appPkg = archiveInfo.packageName ?: ""
 
-                // 修复 P0 漏洞：安全解析 relative application name (如 .MyApplication 或 MyApplication)
+                // 1. 安全解析 application name
                 archiveInfo.applicationInfo?.name?.let { appName ->
                     val fullClsName = when {
                         appName.startsWith(".") -> "$appPkg$appName"
@@ -75,7 +88,7 @@ object AppPackageDetector {
                     }
                 }
 
-                // 读取组件包名
+                // 2. 解析 Manifest 组件包名
                 val components = ArrayList<String>()
                 archiveInfo.activities?.forEach { components.add(it.name) }
                 archiveInfo.services?.forEach { components.add(it.name) }
@@ -122,20 +135,25 @@ object AppPackageDetector {
         return analyze(input, rawClasses.size)
     }
 
+    /**
+     * 针对 CFR 的分析人口（修复 P0-1 漏洞：正确从原始类名中提取 BuildConfig）
+     */
     fun analyzeCfr(zipEntryNames: List<String>): AppCodeAnalysisResult {
         val classNames = zipEntryNames
             .filter { it.endsWith(".class") }
             .map { it.replace('/', '.').substringBeforeLast(".class") }
             .toSet()
 
-        val candidatePkgs = classNames
-            .filter { !FilterHelper.isResourceClass(it) && !FilterHelper.isThirdPartyLibrary(it) }
+        // P0-1 修复：直接从类名列表中安全提取 BuildConfig 所在包
+        val buildConfigPkgs = classNames
+            .filter { it.endsWith(".BuildConfig") || it == "BuildConfig" }
             .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
+            .filter { !FilterHelper.isThirdPartyLibrary(it) }
             .toSet()
 
         val input = AppPackageAnalysisInput(
             manifestPackages = emptySet(),
-            buildConfigPackages = candidatePkgs.filter { it.endsWith(".BuildConfig") || it == "BuildConfig" }.toSet(),
+            buildConfigPackages = buildConfigPkgs,
             applicationPackages = emptySet(),
             allClassNames = classNames,
             classCodeProvider = { null }
@@ -145,27 +163,27 @@ object AppPackageDetector {
     }
 
     /**
-     * 核心评分分析模型 (Package Scoring System)
+     * 四层评分判定系统 (Package Scoring System)
      */
     private fun analyze(input: AppPackageAnalysisInput, rawClassesCount: Int): AppCodeAnalysisResult {
         val packageScores = HashMap<String, Int>()
 
-        // Application 信号：+100 分 (极强证据)
+        // 信号 1：Application 类声明 (+100 分)
         for (pkg in input.applicationPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 100
         }
 
-        // BuildConfig 信号：+80 分
+        // 信号 2：BuildConfig 存在 (+80 分)
         for (pkg in input.buildConfigPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 80
         }
 
-        // Manifest 组件信号：+50 分
+        // 信号 3：Manifest 组件注册 (+50 分)
         for (pkg in input.manifestPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 50
         }
 
-        // 统计类密度：+1 分/类
+        // 信号 4：非第三方类数量密度 (+1 分/类)
         for (clsName in input.allClassNames) {
             if (!FilterHelper.isResourceClass(clsName) && !FilterHelper.isThirdPartyLibrary(clsName)) {
                 val pkg = clsName.substringBeforeLast(".", "")
@@ -175,21 +193,20 @@ object AppPackageDetector {
             }
         }
 
-        // 挑选评分 >= 50 分的领域候选
-        val coreCandidates = packageScores.filter { it.value >= 50 }.keys.toHashSet()
+        // 挑选得分 >= 80 分的强核心包
+        val coreCandidates = packageScores.filter { it.value >= 80 }.keys.toHashSet()
+        // 挑选得分在 40~79 分之间的模块包
+        val moduleCandidates = packageScores.filter { it.value in 40..79 }.keys.toHashSet()
+
         if (coreCandidates.isEmpty() && packageScores.isNotEmpty()) {
             val topPkg = packageScores.maxByOrNull { it.value }?.key
             if (topPkg != null) coreCandidates.add(topPkg)
         }
 
         val coreRoots = findValidatedCommonRoots(coreCandidates)
-
-        val moduleRoots = HashSet<String>()
-        for (pkg in input.manifestPackages) {
-            if (coreRoots.none { root -> pkg == root || pkg.startsWith("$root.") }) {
-                moduleRoots.add(pkg)
-            }
-        }
+        val moduleRoots = findValidatedCommonRoots(moduleCandidates).filter { mod ->
+            coreRoots.none { core -> mod == core || mod.startsWith("$core.") }
+        }.toSet()
 
         val (nativeBridges, gameEngines, externalDeps) = findReferencedLibraries(input, coreRoots + moduleRoots)
 
@@ -203,9 +220,6 @@ object AppPackageDetector {
         )
     }
 
-    /**
-     * 防过宽 Root 校验公共前缀算法
-     */
     private fun findValidatedCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
@@ -229,7 +243,6 @@ object AppPackageDetector {
         }
 
         val commonRootStr = commonPrefix.joinToString(".")
-        // 严禁单一顶级域 (com, org, io) 作为根包导出
         if (commonPrefix.size >= 2 && !FORBIDDEN_TOP_LEVEL_DOMAINS.contains(commonRootStr)) {
             val remainingParts = validPkgs.mapNotNull { pkg ->
                 if (pkg.startsWith("$commonRootStr.")) {
