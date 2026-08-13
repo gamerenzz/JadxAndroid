@@ -6,6 +6,17 @@ import android.util.Log
 import jadx.api.JavaClass
 import java.io.File
 
+/**
+ * 抽象的包分析输入模型，实现 JADX 和 CFR 的零差别对齐
+ */
+data class AppPackageAnalysisInput(
+    val manifestPackages: Set<String>,
+    val buildConfigPackages: Set<String>,
+    val applicationPackages: Set<String>,
+    val allClassNames: Set<String>,
+    val classCodeProvider: (className: String) -> String?
+)
+
 data class AppCodeAnalysisResult(
     val corePackages: Set<String>,
     val modulePackages: Set<String>,
@@ -24,11 +35,12 @@ data class AppCodeAnalysisResult(
     }
 
     fun classify(className: String): ClassCategory {
-        if (gameEngines.any { className == it || className.startsWith("$it.") }) return ClassCategory.GAME_ENGINE
-        if (nativeBridges.any { className == it || className.startsWith("$it.") }) return ClassCategory.NATIVE_BRIDGE
         if (corePackages.any { className == it || className.startsWith("$it.") }) return ClassCategory.APP_CORE
         if (modulePackages.any { className == it || className.startsWith("$it.") }) return ClassCategory.APP_MODULE
-        return ClassCategory.EXTERNAL_DEP
+        if (nativeBridges.any { className == it || className.startsWith("$it.") }) return ClassCategory.NATIVE_BRIDGE
+        if (gameEngines.any { className == it || className.startsWith("$it.") }) return ClassCategory.GAME_ENGINE
+        if (externalDeps.any { className == it || className.startsWith("$it.") }) return ClassCategory.EXTERNAL_DEP
+        return ClassCategory.UNKNOWN
     }
 }
 
@@ -36,11 +48,14 @@ object AppPackageDetector {
 
     private const val TAG = "AppPackageDetector"
 
-    fun analyzeAppCode(context: Context, file: File, rawClasses: List<JavaClass>): AppCodeAnalysisResult {
+    /**
+     * 针对 JADX 的分析入口
+     */
+    fun analyzeJadx(context: Context, file: File, rawClasses: List<JavaClass>): AppCodeAnalysisResult {
         val manifestPkgs = HashSet<String>()
+        val applicationPkgs = HashSet<String>()
         val buildConfigPkgs = HashSet<String>()
 
-        // 1. 读取 Manifest 组件包名 (权重最高 -> APP_CORE)
         try {
             val flags = PackageManager.GET_ACTIVITIES or
                         PackageManager.GET_SERVICES or
@@ -49,6 +64,14 @@ object AppPackageDetector {
 
             val archiveInfo = context.packageManager.getPackageArchiveInfo(file.absolutePath, flags)
             if (archiveInfo != null) {
+                // 强化：提取 <application android:name="...">
+                archiveInfo.applicationInfo?.name?.let { appName ->
+                    val pkg = if (appName.contains(".")) appName.substringBeforeLast(".") else ""
+                    if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
+                        applicationPkgs.add(pkg)
+                    }
+                }
+
                 val components = ArrayList<String>()
                 archiveInfo.activities?.forEach { components.add(it.name) }
                 archiveInfo.services?.forEach { components.add(it.name) }
@@ -66,7 +89,6 @@ object AppPackageDetector {
             Log.w(TAG, "解析 Manifest 异常: ${e.localizedMessage}")
         }
 
-        // 2. 读取 BuildConfig 包名
         for (cls in rawClasses) {
             val fullName = cls.fullName
             if (fullName.endsWith(".BuildConfig") || fullName == "BuildConfig") {
@@ -77,33 +99,73 @@ object AppPackageDetector {
             }
         }
 
-        // 组合 Core 候选包
+        val allClassNames = rawClasses.map { it.fullName }.toSet()
+        val classMap = rawClasses.associateBy { it.fullName }
+
+        val input = AppPackageAnalysisInput(
+            manifestPackages = manifestPkgs,
+            buildConfigPackages = buildConfigPkgs,
+            applicationPackages = applicationPkgs,
+            allClassNames = allClassNames,
+            classCodeProvider = { className -> classMap[className]?.code }
+        )
+
+        return analyze(input)
+    }
+
+    /**
+     * 针对 CFR 的分析入口（使 CFR 共享完全相同的识别算法）
+     */
+    fun analyzeCfr(zipEntryNames: List<String>): AppCodeAnalysisResult {
+        val classNames = zipEntryNames
+            .filter { it.endsWith(".class") }
+            .map { it.replace('/', '.').substringBeforeLast(".class") }
+            .toSet()
+
+        val candidatePkgs = classNames
+            .filter { !FilterHelper.isResourceClass(it) && !FilterHelper.isThirdPartyLibrary(it) }
+            .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
+            .toSet()
+
+        val input = AppPackageAnalysisInput(
+            manifestPackages = emptySet(),
+            buildConfigPackages = candidatePkgs.filter { it.endsWith(".BuildConfig") || it == "BuildConfig" }.toSet(),
+            applicationPackages = emptySet(),
+            allClassNames = classNames,
+            classCodeProvider = { null }
+        )
+
+        return analyze(input)
+    }
+
+    /**
+     * 核心集中分析逻辑
+     */
+    fun analyze(input: AppPackageAnalysisInput): AppCodeAnalysisResult {
+        // Core 强候选：Application 类 + Manifest 组件 + BuildConfig
         val coreCandidates = HashSet<String>()
-        coreCandidates.addAll(manifestPkgs)
-        coreCandidates.addAll(buildConfigPkgs)
+        coreCandidates.addAll(input.applicationPackages)
+        coreCandidates.addAll(input.manifestPackages)
+        coreCandidates.addAll(input.buildConfigPackages)
 
         if (coreCandidates.isEmpty()) {
-            for (cls in rawClasses) {
-                val fullName = cls.fullName
-                if (!FilterHelper.isResourceClass(fullName) && !FilterHelper.isThirdPartyLibrary(fullName)) {
-                    val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
-                    if (pkg.isNotEmpty()) coreCandidates.add(pkg)
-                }
-            }
+            val candidatePkgs = input.allClassNames
+                .filter { !FilterHelper.isResourceClass(it) && !FilterHelper.isThirdPartyLibrary(it) }
+                .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
+                .toSet()
+            coreCandidates.addAll(candidatePkgs)
         }
 
-        val coreRoots = findLongestCommonRoots(coreCandidates)
+        val coreRoots = findValidatedCommonRoots(coreCandidates)
 
-        // 识别 Module 候选包（如 moe.matsuri.nb4a，包含在 Manifest 但不为主根包）
         val moduleRoots = HashSet<String>()
-        for (pkg in manifestPkgs) {
+        for (pkg in input.manifestPackages) {
             if (coreRoots.none { root -> pkg == root || pkg.startsWith("$root.") }) {
                 moduleRoots.add(pkg)
             }
         }
 
-        // 识别动态引用的 Native / 游戏引擎 / 外部库依赖
-        val (nativeBridges, gameEngines, externalDeps) = findReferencedLibraries(rawClasses, coreRoots + moduleRoots)
+        val (nativeBridges, gameEngines, externalDeps) = findReferencedLibraries(input, coreRoots + moduleRoots)
 
         return AppCodeAnalysisResult(
             corePackages = coreRoots,
@@ -114,7 +176,10 @@ object AppPackageDetector {
         )
     }
 
-    private fun findLongestCommonRoots(packages: Set<String>): Set<String> {
+    /**
+     * 防过宽根包的公共包树前缀计算算法
+     */
+    private fun findValidatedCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
         val validPkgs = packages.filter { !FilterHelper.isThirdPartyLibrary(it) }.distinct()
@@ -159,7 +224,7 @@ object AppPackageDetector {
     }
 
     private fun findReferencedLibraries(
-        rawClasses: List<JavaClass>,
+        input: AppPackageAnalysisInput,
         appRoots: Set<String>
     ): Triple<Set<String>, Set<String>, Set<String>> {
         val nativeBridgeCandidates = listOf("go.", "libcore.")
@@ -179,23 +244,21 @@ object AppPackageDetector {
         val activeEngine = HashSet<String>()
         val activeExternal = HashSet<String>()
 
-        val appClasses = rawClasses.filter { cls ->
-            appRoots.any { root -> cls.fullName == root || cls.fullName.startsWith("$root.") }
+        val appClasses = input.allClassNames.filter { clsName ->
+            appRoots.any { root -> clsName == root || clsName.startsWith("$root.") }
         }
 
-        for (cls in appClasses) {
-            try {
-                val code = cls.code
-                for (b in nativeBridgeCandidates) {
-                    if (code.contains(b)) activeNative.add(b.removeSuffix("."))
-                }
-                for (e in gameEngineCandidates) {
-                    if (code.contains(e)) activeEngine.add(e.removeSuffix("."))
-                }
-                for (ext in externalDepCandidates) {
-                    if (code.contains(ext)) activeExternal.add(ext.removeSuffix("."))
-                }
-            } catch (e: Exception) {}
+        for (clsName in appClasses) {
+            val code = input.classCodeProvider(clsName) ?: continue
+            for (b in nativeBridgeCandidates) {
+                if (code.contains(b)) activeNative.add(b.removeSuffix("."))
+            }
+            for (e in gameEngineCandidates) {
+                if (code.contains(e)) activeEngine.add(e.removeSuffix("."))
+            }
+            for (ext in externalDepCandidates) {
+                if (code.contains(ext)) activeExternal.add(ext.removeSuffix("."))
+            }
         }
 
         return Triple(activeNative, activeEngine, activeExternal)
