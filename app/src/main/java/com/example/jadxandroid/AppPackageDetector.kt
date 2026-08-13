@@ -11,12 +11,12 @@ object AppPackageDetector {
     private const val TAG = "AppPackageDetector"
 
     /**
-     * 智能探测整个 APK/JAR 属于 App 自有业务的所有根包名集合
+     * 智能探测 App 自有业务的代码包集合 (运用最长公共包树聚合算法)
      */
     fun detectAppCodeSet(context: Context, file: File, rawClasses: List<JavaClass>): Set<String> {
-        val codeSet = HashSet<String>()
+        val candidatePackages = HashSet<String>()
 
-        // 策略 1：读取 AndroidManifest 中声明的所有组件 (Activity, Service, Receiver, Provider) 真实的类所属包
+        // 1. 搜集 Manifest 中声明的所有真实组件包名
         try {
             val flags = PackageManager.GET_ACTIVITIES or
                         PackageManager.GET_SERVICES or
@@ -34,65 +34,80 @@ object AppPackageDetector {
                 for (clsName in components) {
                     val pkg = if (clsName.contains(".")) clsName.substringBeforeLast(".") else ""
                     if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
-                        val rootPkg = extractRootPackage(pkg)
-                        codeSet.add(rootPkg)
+                        candidatePackages.add(pkg)
                     }
                 }
-                Log.d(TAG, "通过 Manifest 组件成功识别到的业务根包: $codeSet")
             }
         } catch (e: Exception) {
-            Log.w(TAG, "解析 Manifest 组件失败: ${e.localizedMessage}")
+            Log.w(TAG, "解析 Manifest 异常: ${e.localizedMessage}")
         }
 
-        // 策略 2：扫描项目中所有 *.BuildConfig 所在源码包名 (精准提取 applicationId 之外的源码包)
+        // 2. 搜集所有 *.BuildConfig 所在的源码包名
         for (cls in rawClasses) {
             val fullName = cls.fullName
             if (fullName.endsWith(".BuildConfig") || fullName == "BuildConfig") {
                 val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
                 if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
-                    val rootPkg = extractRootPackage(pkg)
-                    codeSet.add(rootPkg)
+                    candidatePackages.add(pkg)
                 }
             }
         }
 
-        // 策略 3：若前两步未提取到（非 APK 文件或无组件），退化使用非第三方类的频次树聚合推断
-        if (codeSet.isEmpty()) {
-            val inferredPkg = inferPackageFromClassTree(rawClasses)
-            if (!inferredPkg.isNullOrEmpty()) {
-                codeSet.add(inferredPkg)
+        // 3. 如果前两步候选包为空，搜集所有非第三方类的包名作为候选
+        if (candidatePackages.isEmpty()) {
+            for (cls in rawClasses) {
+                val fullName = cls.fullName
+                if (!FilterHelper.isResourceClass(fullName) && !FilterHelper.isThirdPartyLibrary(fullName)) {
+                    val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
+                    if (pkg.isNotEmpty()) candidatePackages.add(pkg)
+                }
             }
         }
 
-        Log.i(TAG, "最终认定的 App 业务代码包集合: $codeSet")
-        return codeSet
+        // 4. 核心算法：通过公共前缀树算法，将 candidatePackages 合并归一化为极简的核心业务包树
+        val consolidatedAppRoots = consolidatePackageTree(candidatePackages)
+        Log.i(TAG, "归一化提取到的 App 业务根包: $consolidatedAppRoots")
+
+        return consolidatedAppRoots
     }
 
-    private fun extractRootPackage(pkg: String): String {
-        val parts = pkg.split(".")
-        return if (parts.size >= 3) {
-            parts.take(3).joinToString(".") // 保留前三段包名，如 io.nekohasekai.sagernet
-        } else {
-            pkg
-        }
-    }
+    /**
+     * 核心包树归一化算法：
+     * 输入：[io.nekohasekai.sagernet.ui, io.nekohasekai.sagernet.bg, io.nekohasekai.sagernet.database]
+     * 输出：[io.nekohasekai.sagernet]
+     * 输入：[com.wangwu.jymod52, com.wangwu.jymod52.ui]
+     * 输出：[com.wangwu.jymod52]
+     */
+    private fun consolidatePackageTree(packages: Collection<String>): Set<String> {
+        if (packages.isEmpty()) return emptySet()
 
-    private fun inferPackageFromClassTree(classes: List<JavaClass>): String? {
-        val nonThirdPartyClasses = classes.filter {
-            !FilterHelper.isResourceClass(it.fullName) && !FilterHelper.isThirdPartyLibrary(it.fullName)
-        }
-        if (nonThirdPartyClasses.isEmpty()) return null
+        val validPkgs = packages.filter { !FilterHelper.isThirdPartyLibrary(it) }
+        if (validPkgs.isEmpty()) return emptySet()
 
-        val packageCounts = HashMap<String, Int>()
-        for (cls in nonThirdPartyClasses) {
-            val fullName = cls.fullName
-            val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
-            if (pkg.isNotEmpty()) {
-                packageCounts[pkg] = (packageCounts[pkg] ?: 0) + 1
+        val rootCandidates = HashSet<String>()
+
+        for (pkg in validPkgs) {
+            val parts = pkg.split(".")
+            // 如果包名包含 3 段或以上，先提取最可能的基准前缀（如取前 3 段或前 4 段）
+            if (parts.size >= 4) {
+                rootCandidates.add(parts.take(3).joinToString("."))
+                rootCandidates.add(parts.take(4).joinToString("."))
+            } else {
+                rootCandidates.add(pkg)
             }
         }
 
-        val mostFrequent = packageCounts.maxByOrNull { it.value }?.key ?: return null
-        return extractRootPackage(mostFrequent)
+        // 按照包名长度升序排序，优先保留最简短的根包
+        val sortedCandidates = rootCandidates.sortedBy { it.length }
+        val finalRoots = HashSet<String>()
+
+        for (cand in sortedCandidates) {
+            // 如果当前候选包不属于任何已存在根包的子包，则作为新的根包加入
+            if (finalRoots.none { root -> cand == root || cand.startsWith("$root.") }) {
+                finalRoots.add(cand)
+            }
+        }
+
+        return finalRoots
     }
 }
