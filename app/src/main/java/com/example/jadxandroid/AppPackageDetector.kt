@@ -6,9 +6,6 @@ import android.util.Log
 import jadx.api.JavaClass
 import java.io.File
 
-/**
- * 抽象的包分析输入模型，实现 JADX 和 CFR 的零差别对齐
- */
 data class AppPackageAnalysisInput(
     val manifestPackages: Set<String>,
     val buildConfigPackages: Set<String>,
@@ -22,7 +19,8 @@ data class AppCodeAnalysisResult(
     val modulePackages: Set<String>,
     val nativeBridges: Set<String>,
     val gameEngines: Set<String>,
-    val externalDeps: Set<String>
+    val externalDeps: Set<String>,
+    val rawClassesCount: Int = 0
 ) {
     fun getAllAllowedPackages(): Set<String> {
         val all = HashSet<String>()
@@ -47,10 +45,8 @@ data class AppCodeAnalysisResult(
 object AppPackageDetector {
 
     private const val TAG = "AppPackageDetector"
+    private val FORBIDDEN_TOP_LEVEL_DOMAINS = setOf("com", "org", "net", "io", "cn", "uk", "de", "zh", "jp", "edu", "gov")
 
-    /**
-     * 针对 JADX 的分析入口
-     */
     fun analyzeJadx(context: Context, file: File, rawClasses: List<JavaClass>): AppCodeAnalysisResult {
         val manifestPkgs = HashSet<String>()
         val applicationPkgs = HashSet<String>()
@@ -64,14 +60,22 @@ object AppPackageDetector {
 
             val archiveInfo = context.packageManager.getPackageArchiveInfo(file.absolutePath, flags)
             if (archiveInfo != null) {
-                // 强化：提取 <application android:name="...">
+                val appPkg = archiveInfo.packageName ?: ""
+
+                // 修复 P0 漏洞：安全解析 relative application name (如 .MyApplication 或 MyApplication)
                 archiveInfo.applicationInfo?.name?.let { appName ->
-                    val pkg = if (appName.contains(".")) appName.substringBeforeLast(".") else ""
+                    val fullClsName = when {
+                        appName.startsWith(".") -> "$appPkg$appName"
+                        !appName.contains(".") -> "$appPkg.$appName"
+                        else -> appName
+                    }
+                    val pkg = fullClsName.substringBeforeLast(".", "")
                     if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
                         applicationPkgs.add(pkg)
                     }
                 }
 
+                // 读取组件包名
                 val components = ArrayList<String>()
                 archiveInfo.activities?.forEach { components.add(it.name) }
                 archiveInfo.services?.forEach { components.add(it.name) }
@@ -79,7 +83,12 @@ object AppPackageDetector {
                 archiveInfo.providers?.forEach { components.add(it.name) }
 
                 for (clsName in components) {
-                    val pkg = if (clsName.contains(".")) clsName.substringBeforeLast(".") else ""
+                    val fullClsName = when {
+                        clsName.startsWith(".") -> "$appPkg$clsName"
+                        !clsName.contains(".") -> "$appPkg.$clsName"
+                        else -> clsName
+                    }
+                    val pkg = fullClsName.substringBeforeLast(".", "")
                     if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
                         manifestPkgs.add(pkg)
                     }
@@ -92,7 +101,7 @@ object AppPackageDetector {
         for (cls in rawClasses) {
             val fullName = cls.fullName
             if (fullName.endsWith(".BuildConfig") || fullName == "BuildConfig") {
-                val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
+                val pkg = fullName.substringBeforeLast(".", "")
                 if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
                     buildConfigPkgs.add(pkg)
                 }
@@ -110,12 +119,9 @@ object AppPackageDetector {
             classCodeProvider = { className -> classMap[className]?.code }
         )
 
-        return analyze(input)
+        return analyze(input, rawClasses.size)
     }
 
-    /**
-     * 针对 CFR 的分析入口（使 CFR 共享完全相同的识别算法）
-     */
     fun analyzeCfr(zipEntryNames: List<String>): AppCodeAnalysisResult {
         val classNames = zipEntryNames
             .filter { it.endsWith(".class") }
@@ -135,25 +141,45 @@ object AppPackageDetector {
             classCodeProvider = { null }
         )
 
-        return analyze(input)
+        return analyze(input, classNames.size)
     }
 
     /**
-     * 核心集中分析逻辑
+     * 核心评分分析模型 (Package Scoring System)
      */
-    fun analyze(input: AppPackageAnalysisInput): AppCodeAnalysisResult {
-        // Core 强候选：Application 类 + Manifest 组件 + BuildConfig
-        val coreCandidates = HashSet<String>()
-        coreCandidates.addAll(input.applicationPackages)
-        coreCandidates.addAll(input.manifestPackages)
-        coreCandidates.addAll(input.buildConfigPackages)
+    private fun analyze(input: AppPackageAnalysisInput, rawClassesCount: Int): AppCodeAnalysisResult {
+        val packageScores = HashMap<String, Int>()
 
-        if (coreCandidates.isEmpty()) {
-            val candidatePkgs = input.allClassNames
-                .filter { !FilterHelper.isResourceClass(it) && !FilterHelper.isThirdPartyLibrary(it) }
-                .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
-                .toSet()
-            coreCandidates.addAll(candidatePkgs)
+        // Application 信号：+100 分 (极强证据)
+        for (pkg in input.applicationPackages) {
+            packageScores[pkg] = (packageScores[pkg] ?: 0) + 100
+        }
+
+        // BuildConfig 信号：+80 分
+        for (pkg in input.buildConfigPackages) {
+            packageScores[pkg] = (packageScores[pkg] ?: 0) + 80
+        }
+
+        // Manifest 组件信号：+50 分
+        for (pkg in input.manifestPackages) {
+            packageScores[pkg] = (packageScores[pkg] ?: 0) + 50
+        }
+
+        // 统计类密度：+1 分/类
+        for (clsName in input.allClassNames) {
+            if (!FilterHelper.isResourceClass(clsName) && !FilterHelper.isThirdPartyLibrary(clsName)) {
+                val pkg = clsName.substringBeforeLast(".", "")
+                if (pkg.isNotEmpty()) {
+                    packageScores[pkg] = (packageScores[pkg] ?: 0) + 1
+                }
+            }
+        }
+
+        // 挑选评分 >= 50 分的领域候选
+        val coreCandidates = packageScores.filter { it.value >= 50 }.keys.toHashSet()
+        if (coreCandidates.isEmpty() && packageScores.isNotEmpty()) {
+            val topPkg = packageScores.maxByOrNull { it.value }?.key
+            if (topPkg != null) coreCandidates.add(topPkg)
         }
 
         val coreRoots = findValidatedCommonRoots(coreCandidates)
@@ -172,17 +198,21 @@ object AppPackageDetector {
             modulePackages = moduleRoots,
             nativeBridges = nativeBridges,
             gameEngines = gameEngines,
-            externalDeps = externalDeps
+            externalDeps = externalDeps,
+            rawClassesCount = rawClassesCount
         )
     }
 
     /**
-     * 防过宽根包的公共包树前缀计算算法
+     * 防过宽 Root 校验公共前缀算法
      */
     private fun findValidatedCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
-        val validPkgs = packages.filter { !FilterHelper.isThirdPartyLibrary(it) }.distinct()
+        val validPkgs = packages.filter { pkg ->
+            !FilterHelper.isThirdPartyLibrary(pkg) && !FORBIDDEN_TOP_LEVEL_DOMAINS.contains(pkg)
+        }.distinct()
+
         if (validPkgs.isEmpty()) return emptySet()
         if (validPkgs.size == 1) return validPkgs.toSet()
 
@@ -198,8 +228,9 @@ object AppPackageDetector {
             commonPrefix = commonPrefix.take(j)
         }
 
-        if (commonPrefix.size >= 2) {
-            val commonRootStr = commonPrefix.joinToString(".")
+        val commonRootStr = commonPrefix.joinToString(".")
+        // 严禁单一顶级域 (com, org, io) 作为根包导出
+        if (commonPrefix.size >= 2 && !FORBIDDEN_TOP_LEVEL_DOMAINS.contains(commonRootStr)) {
             val remainingParts = validPkgs.mapNotNull { pkg ->
                 if (pkg.startsWith("$commonRootStr.")) {
                     pkg.removePrefix("$commonRootStr.").split(".").firstOrNull()
