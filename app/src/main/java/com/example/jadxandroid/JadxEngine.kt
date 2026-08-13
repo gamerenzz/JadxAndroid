@@ -21,13 +21,24 @@ class JadxEngine(
     override fun getName(): String = "JADX"
 
     private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, analysisResult: AppCodeAnalysisResult): Boolean {
-        // 在 APP_ONLY 模式下，仅导出纯净的 App 自有代码集合
         val allowedSet = if (filterMode == FilterMode.APP_ONLY) {
             analysisResult.getAppOwnedPackages()
         } else {
             analysisResult.getAllAllowedPackages()
         }
         return FilterHelper.shouldKeepClass(cls.fullName, filterMode, allowedSet)
+    }
+
+    /**
+     * 根据设备当前 JVM 最大可用内存，动态计算最优的批次 Batch Size
+     */
+    private fun calculateOptimalBatchSize(): Int {
+        val maxMemMb = Runtime.getRuntime().maxMemory() / (1024 * 1024)
+        return when {
+            maxMemMb >= 2048 -> 600
+            maxMemMb >= 1024 -> 400
+            else -> 200
+        }
     }
 
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
@@ -128,6 +139,7 @@ class JadxEngine(
                 writer.write("//  JADX 手机版 (JADX 引擎) 结构化代码提取报告\n")
                 writer.write("//  源文件: $currentFileName\n")
                 writer.write("//  过滤模式: ${filterMode.displayName}\n")
+                writer.write("//  注: 统计口径为当前过滤模式 (${filterMode.displayName}) 下实际导出的 Class 数量与分布\n")
                 writer.write("//  \n")
                 writer.write("//  📊 导出代码包分布分类统计:\n")
 
@@ -171,7 +183,7 @@ class JadxEngine(
                 writer.write("// ==========================================\n\n")
 
                 var lastUpdateTime = 0L
-                val BATCH_SIZE = 300
+                val batchSize = calculateOptimalBatchSize()
                 var classIndex = 0
 
                 while (classIndex < totalExported) {
@@ -181,7 +193,7 @@ class JadxEngine(
                         decompiler.load()
 
                         val classesMap = decompiler.classes.associateBy { it.fullName }
-                        val batchEnd = minOf(classIndex + BATCH_SIZE, totalExported)
+                        val batchEnd = minOf(classIndex + batchSize, totalExported)
 
                         for (i in classIndex until batchEnd) {
                             val clsName = classesToDecompile[i]
