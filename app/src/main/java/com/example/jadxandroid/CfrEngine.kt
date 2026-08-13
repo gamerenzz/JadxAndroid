@@ -66,7 +66,6 @@ class CfrEngine(
                         .map { it.name }
                         .toList()
 
-                    // 完全共享相同的识别引擎 AppPackageDetector
                     val analysisResult = AppPackageDetector.analyzeCfr(allEntryNames)
                     val appCodeSet = analysisResult.getAllAllowedPackages()
 
