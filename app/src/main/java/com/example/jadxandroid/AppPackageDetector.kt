@@ -6,17 +6,41 @@ import android.util.Log
 import jadx.api.JavaClass
 import java.io.File
 
+data class AppCodeAnalysisResult(
+    val corePackages: Set<String>,
+    val modulePackages: Set<String>,
+    val nativeBridges: Set<String>,
+    val gameEngines: Set<String>,
+    val externalDeps: Set<String>
+) {
+    fun getAllAllowedPackages(): Set<String> {
+        val all = HashSet<String>()
+        all.addAll(corePackages)
+        all.addAll(modulePackages)
+        all.addAll(nativeBridges)
+        all.addAll(gameEngines)
+        all.addAll(externalDeps)
+        return all
+    }
+
+    fun classify(className: String): ClassCategory {
+        if (gameEngines.any { className == it || className.startsWith("$it.") }) return ClassCategory.GAME_ENGINE
+        if (nativeBridges.any { className == it || className.startsWith("$it.") }) return ClassCategory.NATIVE_BRIDGE
+        if (corePackages.any { className == it || className.startsWith("$it.") }) return ClassCategory.APP_CORE
+        if (modulePackages.any { className == it || className.startsWith("$it.") }) return ClassCategory.APP_MODULE
+        return ClassCategory.EXTERNAL_DEP
+    }
+}
+
 object AppPackageDetector {
 
     private const val TAG = "AppPackageDetector"
 
-    /**
-     * 智能识别 App 自有业务包集合 (动态公共包树算法 + 引用闭包分析)
-     */
-    fun detectAppCodeSet(context: Context, file: File, rawClasses: List<JavaClass>): Set<String> {
-        val rawCandidatePackages = HashSet<String>()
+    fun analyzeAppCode(context: Context, file: File, rawClasses: List<JavaClass>): AppCodeAnalysisResult {
+        val manifestPkgs = HashSet<String>()
+        val buildConfigPkgs = HashSet<String>()
 
-        // 策略 1：读取 Manifest 组件真实包名 (Activity, Service, Receiver, Provider)
+        // 1. 读取 Manifest 组件包名 (权重最高 -> APP_CORE)
         try {
             val flags = PackageManager.GET_ACTIVITIES or
                         PackageManager.GET_SERVICES or
@@ -34,7 +58,7 @@ object AppPackageDetector {
                 for (clsName in components) {
                     val pkg = if (clsName.contains(".")) clsName.substringBeforeLast(".") else ""
                     if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
-                        rawCandidatePackages.add(pkg)
+                        manifestPkgs.add(pkg)
                     }
                 }
             }
@@ -42,49 +66,54 @@ object AppPackageDetector {
             Log.w(TAG, "解析 Manifest 异常: ${e.localizedMessage}")
         }
 
-        // 策略 2：扫描所有 *.BuildConfig 所在源码包名
+        // 2. 读取 BuildConfig 包名
         for (cls in rawClasses) {
             val fullName = cls.fullName
             if (fullName.endsWith(".BuildConfig") || fullName == "BuildConfig") {
                 val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
                 if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
-                    rawCandidatePackages.add(pkg)
+                    buildConfigPkgs.add(pkg)
                 }
             }
         }
 
-        // 策略 3：兜底 - 若 Manifest/BuildConfig 均无结果，收集非第三方类的包名
-        if (rawCandidatePackages.isEmpty()) {
+        // 组合 Core 候选包
+        val coreCandidates = HashSet<String>()
+        coreCandidates.addAll(manifestPkgs)
+        coreCandidates.addAll(buildConfigPkgs)
+
+        if (coreCandidates.isEmpty()) {
             for (cls in rawClasses) {
                 val fullName = cls.fullName
                 if (!FilterHelper.isResourceClass(fullName) && !FilterHelper.isThirdPartyLibrary(fullName)) {
                     val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
-                    if (pkg.isNotEmpty()) rawCandidatePackages.add(pkg)
+                    if (pkg.isNotEmpty()) coreCandidates.add(pkg)
                 }
             }
         }
 
-        // 核心算法 A：动态公共前缀包树算法 (彻底废除 parts.take(3) 硬编码)
-        val appRoots = findLongestCommonRoots(rawCandidatePackages)
+        val coreRoots = findLongestCommonRoots(coreCandidates)
 
-        // 核心算法 B：引用闭包分析 (仅当 App 业务代码真实引用了 Native/框架包时才保留)
-        val dynamicBridges = findReferencedBridges(rawClasses, appRoots)
+        // 识别 Module 候选包（如 moe.matsuri.nb4a，包含在 Manifest 但不为主根包）
+        val moduleRoots = HashSet<String>()
+        for (pkg in manifestPkgs) {
+            if (coreRoots.none { root -> pkg == root || pkg.startsWith("$root.") }) {
+                moduleRoots.add(pkg)
+            }
+        }
 
-        val finalCodeSet = HashSet<String>()
-        finalCodeSet.addAll(appRoots)
-        finalCodeSet.addAll(dynamicBridges)
+        // 识别动态引用的 Native / 游戏引擎 / 外部库依赖
+        val (nativeBridges, gameEngines, externalDeps) = findReferencedLibraries(rawClasses, coreRoots + moduleRoots)
 
-        Log.i(TAG, "计算出最长公共根包: $appRoots | 动态引用扩展依赖: $dynamicBridges")
-        return finalCodeSet
+        return AppCodeAnalysisResult(
+            corePackages = coreRoots,
+            modulePackages = moduleRoots,
+            nativeBridges = nativeBridges,
+            gameEngines = gameEngines,
+            externalDeps = externalDeps
+        )
     }
 
-    /**
-     * 核心算法：计算最长公共包名树 (不依赖任何写死截取层级)
-     * 例 A: [io.nekohasekai.sagernet.ui, io.nekohasekai.sagernet.bg, io.nekohasekai.sagernet.database]
-     *      -> 自动计算出 io.nekohasekai.sagernet
-     * 例 B: [com.wangwu.jymod52, com.wangwu.jymod52.ui]
-     *      -> 自动计算出 com.wangwu.jymod52
-     */
     private fun findLongestCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
@@ -92,10 +121,8 @@ object AppPackageDetector {
         if (validPkgs.isEmpty()) return emptySet()
         if (validPkgs.size == 1) return validPkgs.toSet()
 
-        // 拆分为层级数组
         val splitPackages = validPkgs.map { it.split(".") }
 
-        // 寻找所有候选包的最长公共前缀数组
         var commonPrefix = splitPackages[0]
         for (i in 1 until splitPackages.size) {
             val current = splitPackages[i]
@@ -106,11 +133,8 @@ object AppPackageDetector {
             commonPrefix = commonPrefix.take(j)
         }
 
-        // 如果提取出的公共根包层级 >= 2 (如 io.nekohasekai 或 com.wangwu)
         if (commonPrefix.size >= 2) {
             val commonRootStr = commonPrefix.joinToString(".")
-            
-            // 进一步检查：如果所有包在该前缀之后紧跟相同的第三/四段，自动向下延伸合并
             val remainingParts = validPkgs.mapNotNull { pkg ->
                 if (pkg.startsWith("$commonRootStr.")) {
                     pkg.removePrefix("$commonRootStr.").split(".").firstOrNull()
@@ -124,7 +148,6 @@ object AppPackageDetector {
             }
         }
 
-        // 兜底方案：按包名长度升序去重子包
         val sortedPkgs = validPkgs.sortedBy { it.length }
         val rootSet = HashSet<String>()
         for (pkg in sortedPkgs) {
@@ -135,39 +158,46 @@ object AppPackageDetector {
         return rootSet
     }
 
-    /**
-     * 动态引用闭包分析：检查 App 业务代码源码中是否真实 import/引用了特定 Native/框架包
-     */
-    private fun findReferencedBridges(rawClasses: List<JavaClass>, appRoots: Set<String>): Set<String> {
-        val candidateBridges = listOf(
-            "go.",
-            "libcore.",
+    private fun findReferencedLibraries(
+        rawClasses: List<JavaClass>,
+        appRoots: Set<String>
+    ): Triple<Set<String>, Set<String>, Set<String>> {
+        val nativeBridgeCandidates = listOf("go.", "libcore.")
+        val gameEngineCandidates = listOf(
             "org.libsdl.app.",
             "com.unity3d.player.",
             "org.cocos2dx.lib.",
             "com.epicgames.ue4.",
+            "com.godot.game."
+        )
+        val externalDepCandidates = listOf(
             "com.github.shadowsocks.plugin.",
-            "moe.matsuri.nb4a."
+            "com.jakewharton.processphoenix."
         )
 
-        val activeBridges = HashSet<String>()
+        val activeNative = HashSet<String>()
+        val activeEngine = HashSet<String>()
+        val activeExternal = HashSet<String>()
+
         val appClasses = rawClasses.filter { cls ->
             appRoots.any { root -> cls.fullName == root || cls.fullName.startsWith("$root.") }
         }
 
-        // 快速扫描应用业务源码内容
         for (cls in appClasses) {
             try {
                 val code = cls.code
-                for (bridge in candidateBridges) {
-                    if (code.contains(bridge)) {
-                        activeBridges.add(bridge.removeSuffix("."))
-                    }
+                for (b in nativeBridgeCandidates) {
+                    if (code.contains(b)) activeNative.add(b.removeSuffix("."))
                 }
-            } catch (e: Exception) {
-                // 忽略个别类源码读取异常
-            }
+                for (e in gameEngineCandidates) {
+                    if (code.contains(e)) activeEngine.add(e.removeSuffix("."))
+                }
+                for (ext in externalDepCandidates) {
+                    if (code.contains(ext)) activeExternal.add(ext.removeSuffix("."))
+                }
+            } catch (e: Exception) {}
         }
-        return activeBridges
+
+        return Triple(activeNative, activeEngine, activeExternal)
     }
 }
