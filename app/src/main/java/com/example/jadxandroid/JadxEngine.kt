@@ -21,7 +21,9 @@ class JadxEngine(
     override fun getName(): String = "JADX"
 
     private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appCodeSet: Set<String>): Boolean {
-        if (cls.isInner) return false
+        // 核心修复：彻底废除 if (cls.isInner) return false！
+        // 允许保留 JYmodActivity$1 或 MainActivity$1 等包含具体业务逻辑（如回调/Handler/线程）的内部类；
+        // 仅由 FilterHelper.shouldKeepClass 内部剔除 R$ 资源干扰类。
         return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appCodeSet)
     }
 
