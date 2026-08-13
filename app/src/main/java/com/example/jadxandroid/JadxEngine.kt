@@ -36,7 +36,7 @@ class JadxEngine(
                 decompiler.load()
 
                 val rawClasses = decompiler.classes
-                val analysisResult = AppPackageDetector.analyzeAppCode(context, file, rawClasses)
+                val analysisResult = AppPackageDetector.analyzeJadx(context, file, rawClasses)
                 val appCodeSet = analysisResult.getAllAllowedPackages()
 
                 val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appCodeSet) }
@@ -55,7 +55,7 @@ class JadxEngine(
                     sb.append("//  识别 Native 桥接: ${analysisResult.nativeBridges}\n")
                 }
                 sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
-                sb.append("//  原始类总数: ${rawClasses.size} | 保留展示: ${filteredClasses.size}\n")
+                sb.append("//  原始类总数: ${rawClasses.size} | 展示类数: ${filteredClasses.size}\n")
                 sb.append("// ==========================================\n\n")
 
                 val displayLimit = minOf(filteredClasses.size, 5)
@@ -99,7 +99,7 @@ class JadxEngine(
                     decompiler.load()
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
-                    analysisResult = AppPackageDetector.analyzeAppCode(context, file, rawClasses)
+                    analysisResult = AppPackageDetector.analyzeJadx(context, file, rawClasses)
                     val appCodeSet = analysisResult.getAllAllowedPackages()
 
                     for (cls in rawClasses) {
@@ -109,11 +109,15 @@ class JadxEngine(
                     }
                 }
 
-                // 计算每个分区的类数量
                 val categoryCounts = HashMap<ClassCategory, Int>()
                 for (clsName in classesToDecompile) {
                     val cat = analysisResult.classify(clsName)
                     categoryCounts[cat] = (categoryCounts[cat] ?: 0) + 1
+                }
+
+                val totalExported = classesToDecompile.size
+                val formatPct = { count: Int ->
+                    if (totalExported > 0) String.format("%.1f%%", (count.toDouble() / totalExported) * 100) else "0.0%"
                 }
 
                 writer.write("// ==========================================\n")
@@ -122,43 +126,58 @@ class JadxEngine(
                 writer.write("//  过滤模式: ${filterMode.displayName}\n")
                 writer.write("//  \n")
                 writer.write("//  📊 导出代码包分布分类统计:\n")
-                if (analysisResult.corePackages.isNotEmpty()) {
-                    writer.write("//   📌 [APP_CORE] 主业务核心包 (${categoryCounts[ClassCategory.APP_CORE] ?: 0} 类):\n")
+
+                val coreCount = categoryCounts[ClassCategory.APP_CORE] ?: 0
+                if (analysisResult.corePackages.isNotEmpty() || coreCount > 0) {
+                    writer.write("//   📌 [APP_CORE] 主业务核心代码 ($coreCount 类, ${formatPct(coreCount)}):\n")
                     analysisResult.corePackages.forEach { writer.write("//      - $it.*\n") }
                 }
-                if (analysisResult.modulePackages.isNotEmpty()) {
-                    writer.write("//   📌 [APP_MODULE] 应用组件/扩展模块 (${categoryCounts[ClassCategory.APP_MODULE] ?: 0} 类):\n")
+
+                val moduleCount = categoryCounts[ClassCategory.APP_MODULE] ?: 0
+                if (analysisResult.modulePackages.isNotEmpty() || moduleCount > 0) {
+                    writer.write("//   📌 [APP_MODULE] 应用组件/扩展模块 ($moduleCount 类, ${formatPct(moduleCount)}):\n")
                     analysisResult.modulePackages.forEach { writer.write("//      - $it.*\n") }
                 }
-                if (analysisResult.nativeBridges.isNotEmpty()) {
-                    writer.write("//   📌 [NATIVE_BRIDGE] Go/C++ 原生内核桥接层 (${categoryCounts[ClassCategory.NATIVE_BRIDGE] ?: 0} 类):\n")
+
+                val nativeCount = categoryCounts[ClassCategory.NATIVE_BRIDGE] ?: 0
+                if (analysisResult.nativeBridges.isNotEmpty() || nativeCount > 0) {
+                    writer.write("//   📌 [NATIVE_BRIDGE] Go/C++ 原生内核桥接层 ($nativeCount 类, ${formatPct(nativeCount)}):\n")
                     analysisResult.nativeBridges.forEach { writer.write("//      - $it.*\n") }
                 }
-                if (analysisResult.gameEngines.isNotEmpty()) {
-                    writer.write("//   📌 [GAME_ENGINE] 游戏引擎/框架基类 (${categoryCounts[ClassCategory.GAME_ENGINE] ?: 0} 类):\n")
+
+                val engineCount = categoryCounts[ClassCategory.GAME_ENGINE] ?: 0
+                if (analysisResult.gameEngines.isNotEmpty() || engineCount > 0) {
+                    writer.write("//   📌 [GAME_ENGINE] 游戏引擎/框架基类 ($engineCount 类, ${formatPct(engineCount)}):\n")
                     analysisResult.gameEngines.forEach { writer.write("//      - $it.*\n") }
                 }
-                if (analysisResult.externalDeps.isNotEmpty()) {
-                    writer.write("//   📌 [EXTERNAL_DEP] 关联第三方依赖库 (${categoryCounts[ClassCategory.EXTERNAL_DEP] ?: 0} 类):\n")
+
+                val extCount = categoryCounts[ClassCategory.EXTERNAL_DEP] ?: 0
+                if (analysisResult.externalDeps.isNotEmpty() || extCount > 0) {
+                    writer.write("//   📌 [EXTERNAL_DEP] 关联第三方依赖库 ($extCount 类, ${formatPct(extCount)}):\n")
                     analysisResult.externalDeps.forEach { writer.write("//      - $it.*\n") }
                 }
+
+                val unknownCount = categoryCounts[ClassCategory.UNKNOWN] ?: 0
+                if (unknownCount > 0) {
+                    writer.write("//   📌 [UNKNOWN] 未确定归属代码 ($unknownCount 类, ${formatPct(unknownCount)})\n")
+                }
+
                 writer.write("//  \n")
-                writer.write("//  原始类总数: $totalClassesCount | 实际导出类数: ${classesToDecompile.size}\n")
+                writer.write("//  原始类总数: $totalClassesCount | 实际导出类数: $totalExported\n")
                 writer.write("// ==========================================\n\n")
 
                 var lastUpdateTime = 0L
                 val BATCH_SIZE = 300
                 var classIndex = 0
-                val totalExportCount = classesToDecompile.size
 
-                while (classIndex < totalExportCount) {
+                while (classIndex < totalExported) {
                     yield()
 
                     createFreshDecompiler().use { decompiler ->
                         decompiler.load()
 
                         val classesMap = decompiler.classes.associateBy { it.fullName }
-                        val batchEnd = minOf(classIndex + BATCH_SIZE, totalExportCount)
+                        val batchEnd = minOf(classIndex + BATCH_SIZE, totalExported)
 
                         for (i in classIndex until batchEnd) {
                             val clsName = classesToDecompile[i]
@@ -167,7 +186,7 @@ class JadxEngine(
 
                             if (cls != null) {
                                 val category = analysisResult.classify(cls.fullName)
-                                writer.write("// [$currentCount/$totalExportCount] [分类: ${category.code}] 类名: ${cls.fullName}\n")
+                                writer.write("// [$currentCount/$totalExported] [分类: ${category.code}] 类名: ${cls.fullName}\n")
 
                                 try {
                                     val code = cls.code
