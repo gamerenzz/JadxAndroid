@@ -22,21 +22,14 @@ data class AppCodeAnalysisResult(
     val externalDeps: Set<String>,
     val rawClassesCount: Int = 0
 ) {
-    /**
-     * 核心解耦：仅获取真正属于 App 自有业务的代码包集合 (用于 APP_ONLY 模式)
-     * 排除第三方游戏引擎 (GAME_ENGINE) 和 第三方依赖库 (EXTERNAL_DEP)
-     */
     fun getAppOwnedPackages(): Set<String> {
         val appOwned = HashSet<String>()
         appOwned.addAll(corePackages)
         appOwned.addAll(modulePackages)
-        appOwned.addAll(nativeBridges) // Native 桥接层属于业务运行所必需
+        appOwned.addAll(nativeBridges)
         return appOwned
     }
 
-    /**
-     * 获取所有可保留包 (包含第三方依赖，用于 FILTER_THIRDPARTY 模式)
-     */
     fun getAllAllowedPackages(): Set<String> {
         val all = HashSet<String>()
         all.addAll(getAppOwnedPackages())
@@ -75,7 +68,6 @@ object AppPackageDetector {
             if (archiveInfo != null) {
                 val appPkg = archiveInfo.packageName ?: ""
 
-                // 1. 安全解析 application name
                 archiveInfo.applicationInfo?.name?.let { appName ->
                     val fullClsName = when {
                         appName.startsWith(".") -> "$appPkg$appName"
@@ -88,7 +80,6 @@ object AppPackageDetector {
                     }
                 }
 
-                // 2. 解析 Manifest 组件包名
                 val components = ArrayList<String>()
                 archiveInfo.activities?.forEach { components.add(it.name) }
                 archiveInfo.services?.forEach { components.add(it.name) }
@@ -135,16 +126,12 @@ object AppPackageDetector {
         return analyze(input, rawClasses.size)
     }
 
-    /**
-     * 针对 CFR 的分析人口（修复 P0-1 漏洞：正确从原始类名中提取 BuildConfig）
-     */
     fun analyzeCfr(zipEntryNames: List<String>): AppCodeAnalysisResult {
         val classNames = zipEntryNames
             .filter { it.endsWith(".class") }
             .map { it.replace('/', '.').substringBeforeLast(".class") }
             .toSet()
 
-        // P0-1 修复：直接从类名列表中安全提取 BuildConfig 所在包
         val buildConfigPkgs = classNames
             .filter { it.endsWith(".BuildConfig") || it == "BuildConfig" }
             .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
@@ -162,28 +149,21 @@ object AppPackageDetector {
         return analyze(input, classNames.size)
     }
 
-    /**
-     * 四层评分判定系统 (Package Scoring System)
-     */
     private fun analyze(input: AppPackageAnalysisInput, rawClassesCount: Int): AppCodeAnalysisResult {
         val packageScores = HashMap<String, Int>()
 
-        // 信号 1：Application 类声明 (+100 分)
         for (pkg in input.applicationPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 100
         }
 
-        // 信号 2：BuildConfig 存在 (+80 分)
         for (pkg in input.buildConfigPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 80
         }
 
-        // 信号 3：Manifest 组件注册 (+50 分)
         for (pkg in input.manifestPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 50
         }
 
-        // 信号 4：非第三方类数量密度 (+1 分/类)
         for (clsName in input.allClassNames) {
             if (!FilterHelper.isResourceClass(clsName) && !FilterHelper.isThirdPartyLibrary(clsName)) {
                 val pkg = clsName.substringBeforeLast(".", "")
@@ -193,9 +173,7 @@ object AppPackageDetector {
             }
         }
 
-        // 挑选得分 >= 80 分的强核心包
         val coreCandidates = packageScores.filter { it.value >= 80 }.keys.toHashSet()
-        // 挑选得分在 40~79 分之间的模块包
         val moduleCandidates = packageScores.filter { it.value in 40..79 }.keys.toHashSet()
 
         if (coreCandidates.isEmpty() && packageScores.isNotEmpty()) {
@@ -220,6 +198,10 @@ object AppPackageDetector {
         )
     }
 
+    /**
+     * 精准包树根节点提取（严格遵循“宁可精简，严禁过宽”原则）：
+     * 严禁将 com.abc.app 和 com.abc.sdk 这类 2~3 级兄弟包向上过宽过度合并为 com.abc
+     */
     private fun findValidatedCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
@@ -230,37 +212,18 @@ object AppPackageDetector {
         if (validPkgs.isEmpty()) return emptySet()
         if (validPkgs.size == 1) return validPkgs.toSet()
 
-        val splitPackages = validPkgs.map { it.split(".") }
-
-        var commonPrefix = splitPackages[0]
-        for (i in 1 until splitPackages.size) {
-            val current = splitPackages[i]
-            var j = 0
-            while (j < commonPrefix.size && j < current.size && commonPrefix[j] == current[j]) {
-                j++
-            }
-            commonPrefix = commonPrefix.take(j)
-        }
-
-        val commonRootStr = commonPrefix.joinToString(".")
-        if (commonPrefix.size >= 2 && !FORBIDDEN_TOP_LEVEL_DOMAINS.contains(commonRootStr)) {
-            val remainingParts = validPkgs.mapNotNull { pkg ->
-                if (pkg.startsWith("$commonRootStr.")) {
-                    pkg.removePrefix("$commonRootStr.").split(".").firstOrNull()
-                } else null
-            }.distinct()
-
-            return if (remainingParts.size == 1) {
-                setOf("$commonRootStr.${remainingParts[0]}")
-            } else {
-                setOf(commonRootStr)
-            }
-        }
-
         val sortedPkgs = validPkgs.sortedBy { it.length }
         val rootSet = HashSet<String>()
+
         for (pkg in sortedPkgs) {
-            if (rootSet.none { root -> pkg == root || pkg.startsWith("$root.") }) {
+            val parts = pkg.split(".")
+            // 仅当包名深度 >= 3 (如 io.nekohasekai.sagernet) 时，才允许作为根节点收拢其明确的子包
+            if (parts.size >= 3) {
+                if (rootSet.none { root -> pkg == root || pkg.startsWith("$root.") }) {
+                    rootSet.add(pkg)
+                }
+            } else {
+                // 对于 2 级包 (如 com.wangwu)，保持独立隔离，严禁合并兄弟包
                 rootSet.add(pkg)
             }
         }
