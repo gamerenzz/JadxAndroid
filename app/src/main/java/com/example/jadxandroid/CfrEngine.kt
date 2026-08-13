@@ -47,21 +47,26 @@ class CfrEngine(
         }
     }
 
-    private fun inferPackageNameFromZip(entries: List<String>): String? {
+    /**
+     * 针对 ZIP/JAR 文件推断其 Java 业务代码包集合
+     */
+    private fun inferAppCodeSetFromZip(entries: List<String>): Set<String> {
         val classNames = entries.map { it.replace('/', '.').substringBeforeLast(".class") }
-        val packageCounts = HashMap<String, Int>()
+        val candidatePkgs = classNames
+            .filter { !FilterHelper.isResourceClass(it) && !FilterHelper.isThirdPartyLibrary(it) }
+            .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
+            .toSet()
 
-        for (name in classNames) {
-            if (!FilterHelper.isResourceClass(name) && !FilterHelper.isThirdPartyLibrary(name)) {
-                val pkg = if (name.contains(".")) name.substringBeforeLast(".") else ""
-                if (pkg.isNotEmpty()) {
-                    packageCounts[pkg] = (packageCounts[pkg] ?: 0) + 1
-                }
+        if (candidatePkgs.isEmpty()) return emptySet()
+
+        val sorted = candidatePkgs.sortedBy { it.length }
+        val roots = HashSet<String>()
+        for (pkg in sorted) {
+            if (roots.none { root -> pkg == root || pkg.startsWith("$root.") }) {
+                roots.add(pkg)
             }
         }
-        val mostFrequent = packageCounts.maxByOrNull { it.value }?.key ?: return null
-        val parts = mostFrequent.split(".")
-        return if (parts.size >= 3) parts.take(3).joinToString(".") else mostFrequent
+        return roots
     }
 
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
@@ -83,13 +88,13 @@ class CfrEngine(
                         .map { it.name }
                         .toList()
 
-                    val appPackageName = inferPackageNameFromZip(allEntryNames)
+                    val appCodeSet = inferAppCodeSetFromZip(allEntryNames)
 
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
                         .filter { entry ->
                             val className = entry.name.replace('/', '.').substringBeforeLast(".class")
-                            FilterHelper.shouldKeepClass(className, filterMode, appPackageName)
+                            FilterHelper.shouldKeepClass(className, filterMode, appCodeSet)
                         }
                         .toList()
 
@@ -149,21 +154,21 @@ class CfrEngine(
                             .map { it.name }
                             .toList()
 
-                        val appPackageName = inferPackageNameFromZip(allEntryNames)
+                        val appCodeSet = inferAppCodeSetFromZip(allEntryNames)
 
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
                             .filter { entry ->
                                 val className = entry.name.replace('/', '.').substringBeforeLast(".class")
-                                FilterHelper.shouldKeepClass(className, filterMode, appPackageName)
+                                FilterHelper.shouldKeepClass(className, filterMode, appCodeSet)
                             }
                             .toList()
 
                         writer.write("// ==========================================\n")
                         writer.write("//  JADX 手机版 (CFR 引擎) 自动生成\n")
                         writer.write("//  源文件: $currentFileName\n")
-                        if (!appPackageName.isNullOrEmpty()) {
-                            writer.write("//  应用主包名: $appPackageName\n")
+                        if (appCodeSet.isNotEmpty()) {
+                            writer.write("//  识别应用业务根包: $appCodeSet\n")
                         }
                         writer.write("//  过滤模式: ${filterMode.displayName}\n")
                         writer.write("//  实际导出类数: ${entries.size}\n")
