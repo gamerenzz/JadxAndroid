@@ -47,28 +47,6 @@ class CfrEngine(
         }
     }
 
-    /**
-     * 针对 ZIP/JAR 文件推断其 Java 业务代码包集合
-     */
-    private fun inferAppCodeSetFromZip(entries: List<String>): Set<String> {
-        val classNames = entries.map { it.replace('/', '.').substringBeforeLast(".class") }
-        val candidatePkgs = classNames
-            .filter { !FilterHelper.isResourceClass(it) && !FilterHelper.isThirdPartyLibrary(it) }
-            .mapNotNull { if (it.contains(".")) it.substringBeforeLast(".") else null }
-            .toSet()
-
-        if (candidatePkgs.isEmpty()) return emptySet()
-
-        val sorted = candidatePkgs.sortedBy { it.length }
-        val roots = HashSet<String>()
-        for (pkg in sorted) {
-            if (roots.none { root -> pkg == root || pkg.startsWith("$root.") }) {
-                roots.add(pkg)
-            }
-        }
-        return roots
-    }
-
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
         if (isApkOrDex(file)) {
             return@withContext "CFR 引擎仅支持标准 Java .class 或 .jar/.zip 文件。\n安卓 .apk/.dex 请切换至 JADX 引擎解析。"
@@ -88,7 +66,9 @@ class CfrEngine(
                         .map { it.name }
                         .toList()
 
-                    val appCodeSet = inferAppCodeSetFromZip(allEntryNames)
+                    // 完全共享相同的识别引擎 AppPackageDetector
+                    val analysisResult = AppPackageDetector.analyzeCfr(allEntryNames)
+                    val appCodeSet = analysisResult.getAllAllowedPackages()
 
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
@@ -102,11 +82,19 @@ class CfrEngine(
                         return@withContext "未在文件中找到符合当前过滤规则的类。"
                     }
 
-                    sb.append("// 成功解析，保留 ${entries.size} 个类（模式: ${filterMode.displayName}）\n\n")
-                    
+                    sb.append("// ==========================================\n")
+                    sb.append("//  CFR 引擎 结构化代码提取报告\n")
+                    sb.append("//  识别核心包: ${analysisResult.corePackages}\n")
+                    sb.append("//  过滤模式: ${filterMode.displayName}\n")
+                    sb.append("//  保留展示: ${entries.size} 个类\n")
+                    sb.append("// ==========================================\n\n")
+
                     val displayLimit = minOf(entries.size, 5)
                     for (i in 0 until displayLimit) {
                         val entry = entries[i]
+                        val className = entry.name.replace('/', '.').substringBeforeLast(".class")
+                        val category = analysisResult.classify(className)
+
                         val tempClassFile = File(context.cacheDir, "TempDecompile.class")
                         if (tempClassFile.exists()) tempClassFile.delete()
 
@@ -119,7 +107,7 @@ class CfrEngine(
                         val code = decompileSingleClass(tempClassFile, file)
                         tempClassFile.delete()
 
-                        sb.append("// 类名: ${entry.name.replace('/', '.').substringBeforeLast(".class")}\n")
+                        sb.append("// [预览 ${i + 1}/$displayLimit] [${category.code}] 类名: $className\n")
                         sb.append(code)
                         sb.append("\n\n// ==========================================\n\n")
                     }
@@ -154,7 +142,8 @@ class CfrEngine(
                             .map { it.name }
                             .toList()
 
-                        val appCodeSet = inferAppCodeSetFromZip(allEntryNames)
+                        val analysisResult = AppPackageDetector.analyzeCfr(allEntryNames)
+                        val appCodeSet = analysisResult.getAllAllowedPackages()
 
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
@@ -164,14 +153,62 @@ class CfrEngine(
                             }
                             .toList()
 
-                        writer.write("// ==========================================\n")
-                        writer.write("//  JADX 手机版 (CFR 引擎) 自动生成\n")
-                        writer.write("//  源文件: $currentFileName\n")
-                        if (appCodeSet.isNotEmpty()) {
-                            writer.write("//  识别应用业务根包: $appCodeSet\n")
+                        val totalExported = entries.size
+                        val categoryCounts = HashMap<ClassCategory, Int>()
+                        entries.forEach { entry ->
+                            val className = entry.name.replace('/', '.').substringBeforeLast(".class")
+                            val cat = analysisResult.classify(className)
+                            categoryCounts[cat] = (categoryCounts[cat] ?: 0) + 1
                         }
+
+                        val formatPct = { count: Int ->
+                            if (totalExported > 0) String.format("%.1f%%", (count.toDouble() / totalExported) * 100) else "0.0%"
+                        }
+
+                        writer.write("// ==========================================\n")
+                        writer.write("//  JADX 手机版 (CFR 引擎) 结构化代码提取报告\n")
+                        writer.write("//  源文件: $currentFileName\n")
                         writer.write("//  过滤模式: ${filterMode.displayName}\n")
-                        writer.write("//  实际导出类数: ${entries.size}\n")
+                        writer.write("//  \n")
+                        writer.write("//  📊 导出代码包分布分类统计:\n")
+
+                        val coreCount = categoryCounts[ClassCategory.APP_CORE] ?: 0
+                        if (analysisResult.corePackages.isNotEmpty() || coreCount > 0) {
+                            writer.write("//   📌 [APP_CORE] 主业务核心代码 ($coreCount 类, ${formatPct(coreCount)}):\n")
+                            analysisResult.corePackages.forEach { writer.write("//      - $it.*\n") }
+                        }
+
+                        val moduleCount = categoryCounts[ClassCategory.APP_MODULE] ?: 0
+                        if (analysisResult.modulePackages.isNotEmpty() || moduleCount > 0) {
+                            writer.write("//   📌 [APP_MODULE] 应用组件/扩展模块 ($moduleCount 类, ${formatPct(moduleCount)}):\n")
+                            analysisResult.modulePackages.forEach { writer.write("//      - $it.*\n") }
+                        }
+
+                        val nativeCount = categoryCounts[ClassCategory.NATIVE_BRIDGE] ?: 0
+                        if (analysisResult.nativeBridges.isNotEmpty() || nativeCount > 0) {
+                            writer.write("//   📌 [NATIVE_BRIDGE] Go/C++ 原生内核桥接层 ($nativeCount 类, ${formatPct(nativeCount)}):\n")
+                            analysisResult.nativeBridges.forEach { writer.write("//      - $it.*\n") }
+                        }
+
+                        val engineCount = categoryCounts[ClassCategory.GAME_ENGINE] ?: 0
+                        if (analysisResult.gameEngines.isNotEmpty() || engineCount > 0) {
+                            writer.write("//   📌 [GAME_ENGINE] 游戏引擎/框架基类 ($engineCount 类, ${formatPct(engineCount)}):\n")
+                            analysisResult.gameEngines.forEach { writer.write("//      - $it.*\n") }
+                        }
+
+                        val extCount = categoryCounts[ClassCategory.EXTERNAL_DEP] ?: 0
+                        if (analysisResult.externalDeps.isNotEmpty() || extCount > 0) {
+                            writer.write("//   📌 [EXTERNAL_DEP] 关联第三方依赖库 ($extCount 类, ${formatPct(extCount)}):\n")
+                            analysisResult.externalDeps.forEach { writer.write("//      - $it.*\n") }
+                        }
+
+                        val unknownCount = categoryCounts[ClassCategory.UNKNOWN] ?: 0
+                        if (unknownCount > 0) {
+                            writer.write("//   📌 [UNKNOWN] 未确定归属代码 ($unknownCount 类, ${formatPct(unknownCount)})\n")
+                        }
+
+                        writer.write("//  \n")
+                        writer.write("//  实际导出类数: $totalExported\n")
                         writer.write("// ==========================================\n\n")
 
                         val total = entries.size
@@ -180,7 +217,9 @@ class CfrEngine(
                         entries.forEachIndexed { index, entry ->
                             yield()
                             val className = entry.name.replace('/', '.').substringBeforeLast(".class")
-                            writer.write("// [类 ${index + 1}/$total] 类名: $className\n")
+                            val category = analysisResult.classify(className)
+
+                            writer.write("// [类 ${index + 1}/$total] [分类: ${category.code}] 类名: $className\n")
 
                             try {
                                 val tempClassFile = File(context.cacheDir, "TempDecompile.class")
