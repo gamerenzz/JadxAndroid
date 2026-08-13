@@ -217,9 +217,9 @@ class JadxEngine(
                             }
 
                             val currentTime = System.currentTimeMillis()
-                            if (currentTime - lastUpdateTime > 500 || currentCount == totalExportCount) {
+                            if (currentTime - lastUpdateTime > 500 || currentCount == totalExported) {
                                 lastUpdateTime = currentTime
-                                onProgress(currentCount, totalExportCount, clsName)
+                                onProgress(currentCount, totalExported, clsName)
                             }
 
                             yield()
