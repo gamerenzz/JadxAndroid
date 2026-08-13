@@ -21,8 +21,6 @@ class JadxEngine(
     override fun getName(): String = "JADX"
 
     private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appCodeSet: Set<String>): Boolean {
-        // 彻底废除 if (cls.isInner) return false！
-        // 保留点击事件/Handler/回调函数内部类，仅过滤 R$ 资源类
         return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appCodeSet)
     }
 
@@ -38,7 +36,8 @@ class JadxEngine(
                 decompiler.load()
 
                 val rawClasses = decompiler.classes
-                val appCodeSet = AppPackageDetector.detectAppCodeSet(context, file, rawClasses)
+                val analysisResult = AppPackageDetector.analyzeAppCode(context, file, rawClasses)
+                val appCodeSet = analysisResult.getAllAllowedPackages()
 
                 val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appCodeSet) }
 
@@ -47,23 +46,25 @@ class JadxEngine(
                 }
 
                 sb.append("// ==========================================\n")
-                sb.append("//  JADX 引擎反编译预览\n")
-                if (appCodeSet.isNotEmpty()) {
-                    sb.append("//  💡 识别应用业务根包: $appCodeSet\n")
+                sb.append("//  JADX 手机版 结构化代码提取报告\n")
+                sb.append("//  识别主业务根包: ${analysisResult.corePackages}\n")
+                if (analysisResult.modulePackages.isNotEmpty()) {
+                    sb.append("//  识别扩展模块包: ${analysisResult.modulePackages}\n")
+                }
+                if (analysisResult.nativeBridges.isNotEmpty()) {
+                    sb.append("//  识别 Native 桥接: ${analysisResult.nativeBridges}\n")
                 }
                 sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
-                sb.append("//  原始类总数: ${rawClasses.size} | 过滤后保留: ${filteredClasses.size}\n")
+                sb.append("//  原始类总数: ${rawClasses.size} | 保留展示: ${filteredClasses.size}\n")
                 sb.append("// ==========================================\n\n")
 
                 val displayLimit = minOf(filteredClasses.size, 5)
                 for (i in 0 until displayLimit) {
                     val cls = filteredClasses[i]
-                    sb.append("// [预览 ${i + 1}/$displayLimit] 类名: ${cls.fullName}\n")
+                    val category = analysisResult.classify(cls.fullName)
+                    sb.append("// [预览 ${i + 1}/$displayLimit] [${category.code}] 类名: ${cls.fullName}\n")
                     sb.append(cls.code)
                     sb.append("\n\n// ==========================================\n\n")
-                }
-                if (filteredClasses.size > displayLimit) {
-                    sb.append("// ... 其余 ${filteredClasses.size - displayLimit} 个类未展示，点击保存导出完整 TXT ...")
                 }
             }
         } catch (e: Exception) {
@@ -91,14 +92,15 @@ class JadxEngine(
                 }
 
                 var totalClassesCount = 0
-                var appCodeSet: Set<String> = emptySet()
+                lateinit var analysisResult: AppCodeAnalysisResult
                 val classesToDecompile = ArrayList<String>()
 
                 createFreshDecompiler().use { decompiler ->
                     decompiler.load()
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
-                    appCodeSet = AppPackageDetector.detectAppCodeSet(context, file, rawClasses)
+                    analysisResult = AppPackageDetector.analyzeAppCode(context, file, rawClasses)
+                    val appCodeSet = analysisResult.getAllAllowedPackages()
 
                     for (cls in rawClasses) {
                         if (shouldKeepJavaClass(cls, filterMode, appCodeSet)) {
@@ -107,15 +109,41 @@ class JadxEngine(
                     }
                 }
 
-                writer.write("// ==========================================\n")
-                writer.write("//  JADX 手机版 (JADX 引擎) 自动生成\n")
-                writer.write("//  源文件: $currentFileName\n")
-                if (appCodeSet.isNotEmpty()) {
-                    writer.write("//  识别应用业务根包: $appCodeSet\n")
+                // 计算每个分区的类数量
+                val categoryCounts = HashMap<ClassCategory, Int>()
+                for (clsName in classesToDecompile) {
+                    val cat = analysisResult.classify(clsName)
+                    categoryCounts[cat] = (categoryCounts[cat] ?: 0) + 1
                 }
+
+                writer.write("// ==========================================\n")
+                writer.write("//  JADX 手机版 (JADX 引擎) 结构化代码提取报告\n")
+                writer.write("//  源文件: $currentFileName\n")
                 writer.write("//  过滤模式: ${filterMode.displayName}\n")
-                writer.write("//  原始类总数: $totalClassesCount\n")
-                writer.write("//  实际导出类数: ${classesToDecompile.size}\n")
+                writer.write("//  \n")
+                writer.write("//  📊 导出代码包分布分类统计:\n")
+                if (analysisResult.corePackages.isNotEmpty()) {
+                    writer.write("//   📌 [APP_CORE] 主业务核心包 (${categoryCounts[ClassCategory.APP_CORE] ?: 0} 类):\n")
+                    analysisResult.corePackages.forEach { writer.write("//      - $it.*\n") }
+                }
+                if (analysisResult.modulePackages.isNotEmpty()) {
+                    writer.write("//   📌 [APP_MODULE] 应用组件/扩展模块 (${categoryCounts[ClassCategory.APP_MODULE] ?: 0} 类):\n")
+                    analysisResult.modulePackages.forEach { writer.write("//      - $it.*\n") }
+                }
+                if (analysisResult.nativeBridges.isNotEmpty()) {
+                    writer.write("//   📌 [NATIVE_BRIDGE] Go/C++ 原生内核桥接层 (${categoryCounts[ClassCategory.NATIVE_BRIDGE] ?: 0} 类):\n")
+                    analysisResult.nativeBridges.forEach { writer.write("//      - $it.*\n") }
+                }
+                if (analysisResult.gameEngines.isNotEmpty()) {
+                    writer.write("//   📌 [GAME_ENGINE] 游戏引擎/框架基类 (${categoryCounts[ClassCategory.GAME_ENGINE] ?: 0} 类):\n")
+                    analysisResult.gameEngines.forEach { writer.write("//      - $it.*\n") }
+                }
+                if (analysisResult.externalDeps.isNotEmpty()) {
+                    writer.write("//   📌 [EXTERNAL_DEP] 关联第三方依赖库 (${categoryCounts[ClassCategory.EXTERNAL_DEP] ?: 0} 类):\n")
+                    analysisResult.externalDeps.forEach { writer.write("//      - $it.*\n") }
+                }
+                writer.write("//  \n")
+                writer.write("//  原始类总数: $totalClassesCount | 实际导出类数: ${classesToDecompile.size}\n")
                 writer.write("// ==========================================\n\n")
 
                 var lastUpdateTime = 0L
@@ -138,7 +166,8 @@ class JadxEngine(
                             val currentCount = i + 1
 
                             if (cls != null) {
-                                writer.write("// [$currentCount/$totalExportCount] 类名: ${cls.fullName}\n")
+                                val category = analysisResult.classify(cls.fullName)
+                                writer.write("// [$currentCount/$totalExportCount] [分类: ${category.code}] 类名: ${cls.fullName}\n")
 
                                 try {
                                     val code = cls.code
@@ -146,7 +175,6 @@ class JadxEngine(
                                 } catch (e: Throwable) {
                                     Log.e(TAG, "类 ${cls.fullName} 解析异常: ${e.localizedMessage}")
                                     writer.write("// !!! 警告：该类反编译失败 (已跳过) !!!\n")
-                                    writer.write("// 错误日志: ${e.localizedMessage}\n")
                                 }
 
                                 writer.write("\n\n// ------------------------------------------\n\n")
