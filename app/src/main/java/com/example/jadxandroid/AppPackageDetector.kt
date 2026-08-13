@@ -7,6 +7,7 @@ import jadx.api.JavaClass
 import java.io.File
 
 data class AppPackageAnalysisInput(
+    val manifestApplicationId: String?, // P0-1 引入应用安装包名作为最高权重强锚点
     val manifestPackages: Set<String>,
     val buildConfigPackages: Set<String>,
     val applicationPackages: Set<String>,
@@ -57,6 +58,7 @@ object AppPackageDetector {
         val manifestPkgs = HashSet<String>()
         val applicationPkgs = HashSet<String>()
         val buildConfigPkgs = HashSet<String>()
+        var appId: String? = null
 
         try {
             val flags = PackageManager.GET_ACTIVITIES or
@@ -66,7 +68,8 @@ object AppPackageDetector {
 
             val archiveInfo = context.packageManager.getPackageArchiveInfo(file.absolutePath, flags)
             if (archiveInfo != null) {
-                val appPkg = archiveInfo.packageName ?: ""
+                appId = archiveInfo.packageName
+                val appPkg = appId ?: ""
 
                 archiveInfo.applicationInfo?.name?.let { appName ->
                     val fullClsName = when {
@@ -116,6 +119,7 @@ object AppPackageDetector {
         val classMap = rawClasses.associateBy { it.fullName }
 
         val input = AppPackageAnalysisInput(
+            manifestApplicationId = appId,
             manifestPackages = manifestPkgs,
             buildConfigPackages = buildConfigPkgs,
             applicationPackages = applicationPkgs,
@@ -126,9 +130,17 @@ object AppPackageDetector {
         return analyze(input, rawClasses.size)
     }
 
+    /**
+     * 针对 CFR 的分析入口（P0-2 修复：过滤 META-INF 及 module-info 等干扰项）
+     */
     fun analyzeCfr(zipEntryNames: List<String>): AppCodeAnalysisResult {
         val classNames = zipEntryNames
-            .filter { it.endsWith(".class") }
+            .filter { entry ->
+                entry.endsWith(".class") &&
+                !entry.startsWith("META-INF/") &&
+                !entry.endsWith("module-info.class") &&
+                !entry.endsWith("package-info.class")
+            }
             .map { it.replace('/', '.').substringBeforeLast(".class") }
             .toSet()
 
@@ -139,6 +151,7 @@ object AppPackageDetector {
             .toSet()
 
         val input = AppPackageAnalysisInput(
+            manifestApplicationId = null,
             manifestPackages = emptySet(),
             buildConfigPackages = buildConfigPkgs,
             applicationPackages = emptySet(),
@@ -149,31 +162,50 @@ object AppPackageDetector {
         return analyze(input, classNames.size)
     }
 
+    /**
+     * 五级强证据评分与包树继承模型
+     */
     private fun analyze(input: AppPackageAnalysisInput, rawClassesCount: Int): AppCodeAnalysisResult {
         val packageScores = HashMap<String, Int>()
 
+        // 强信号 1：ApplicationId 强锚点 (+1000 分)
+        if (!input.manifestApplicationId.isNullOrEmpty() && !FilterHelper.isThirdPartyLibrary(input.manifestApplicationId)) {
+            packageScores[input.manifestApplicationId] = (packageScores[input.manifestApplicationId] ?: 0) + 1000
+        }
+
+        // 强信号 2：Application 类声明 (+100 分)
         for (pkg in input.applicationPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 100
         }
 
+        // 信号 3：BuildConfig 存在 (+80 分)
         for (pkg in input.buildConfigPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 80
         }
 
+        // 信号 4：Manifest 组件注册 (+50 分)
         for (pkg in input.manifestPackages) {
             packageScores[pkg] = (packageScores[pkg] ?: 0) + 50
         }
 
+        // 信号 5：类密度向上继承累加 (+1 分/类向上扩散至父包)
         for (clsName in input.allClassNames) {
             if (!FilterHelper.isResourceClass(clsName) && !FilterHelper.isThirdPartyLibrary(clsName)) {
                 val pkg = clsName.substringBeforeLast(".", "")
                 if (pkg.isNotEmpty()) {
                     packageScores[pkg] = (packageScores[pkg] ?: 0) + 1
+                    // 向上扩散累加给父包
+                    val parentPkg = pkg.substringBeforeLast(".", "")
+                    if (parentPkg.isNotEmpty() && !FORBIDDEN_TOP_LEVEL_DOMAINS.contains(parentPkg)) {
+                        packageScores[parentPkg] = (packageScores[parentPkg] ?: 0) + 1
+                    }
                 }
             }
         }
 
+        // 挑选得分 >= 80 分的强核心包
         val coreCandidates = packageScores.filter { it.value >= 80 }.keys.toHashSet()
+        // 挑选得分在 40~79 分之间的模块包
         val moduleCandidates = packageScores.filter { it.value in 40..79 }.keys.toHashSet()
 
         if (coreCandidates.isEmpty() && packageScores.isNotEmpty()) {
@@ -198,10 +230,6 @@ object AppPackageDetector {
         )
     }
 
-    /**
-     * 精准包树根节点提取（严格遵循“宁可精简，严禁过宽”原则）：
-     * 严禁将 com.abc.app 和 com.abc.sdk 这类 2~3 级兄弟包向上过宽过度合并为 com.abc
-     */
     private fun findValidatedCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
@@ -217,13 +245,11 @@ object AppPackageDetector {
 
         for (pkg in sortedPkgs) {
             val parts = pkg.split(".")
-            // 仅当包名深度 >= 3 (如 io.nekohasekai.sagernet) 时，才允许作为根节点收拢其明确的子包
             if (parts.size >= 3) {
                 if (rootSet.none { root -> pkg == root || pkg.startsWith("$root.") }) {
                     rootSet.add(pkg)
                 }
             } else {
-                // 对于 2 级包 (如 com.wangwu)，保持独立隔离，严禁合并兄弟包
                 rootSet.add(pkg)
             }
         }
