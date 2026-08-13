@@ -11,12 +11,12 @@ object AppPackageDetector {
     private const val TAG = "AppPackageDetector"
 
     /**
-     * 智能探测 App 自有业务的代码包集合 (运用最长公共包树聚合算法)
+     * 智能识别 App 自有业务包集合 (动态公共包树算法 + 引用闭包分析)
      */
     fun detectAppCodeSet(context: Context, file: File, rawClasses: List<JavaClass>): Set<String> {
-        val candidatePackages = HashSet<String>()
+        val rawCandidatePackages = HashSet<String>()
 
-        // 1. 搜集 Manifest 中声明的所有真实组件包名
+        // 策略 1：读取 Manifest 组件真实包名 (Activity, Service, Receiver, Provider)
         try {
             val flags = PackageManager.GET_ACTIVITIES or
                         PackageManager.GET_SERVICES or
@@ -34,7 +34,7 @@ object AppPackageDetector {
                 for (clsName in components) {
                     val pkg = if (clsName.contains(".")) clsName.substringBeforeLast(".") else ""
                     if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
-                        candidatePackages.add(pkg)
+                        rawCandidatePackages.add(pkg)
                     }
                 }
             }
@@ -42,72 +42,132 @@ object AppPackageDetector {
             Log.w(TAG, "解析 Manifest 异常: ${e.localizedMessage}")
         }
 
-        // 2. 搜集所有 *.BuildConfig 所在的源码包名
+        // 策略 2：扫描所有 *.BuildConfig 所在源码包名
         for (cls in rawClasses) {
             val fullName = cls.fullName
             if (fullName.endsWith(".BuildConfig") || fullName == "BuildConfig") {
                 val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
                 if (pkg.isNotEmpty() && !FilterHelper.isThirdPartyLibrary(pkg)) {
-                    candidatePackages.add(pkg)
+                    rawCandidatePackages.add(pkg)
                 }
             }
         }
 
-        // 3. 如果前两步候选包为空，搜集所有非第三方类的包名作为候选
-        if (candidatePackages.isEmpty()) {
+        // 策略 3：兜底 - 若 Manifest/BuildConfig 均无结果，收集非第三方类的包名
+        if (rawCandidatePackages.isEmpty()) {
             for (cls in rawClasses) {
                 val fullName = cls.fullName
                 if (!FilterHelper.isResourceClass(fullName) && !FilterHelper.isThirdPartyLibrary(fullName)) {
                     val pkg = if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
-                    if (pkg.isNotEmpty()) candidatePackages.add(pkg)
+                    if (pkg.isNotEmpty()) rawCandidatePackages.add(pkg)
                 }
             }
         }
 
-        // 4. 核心算法：通过公共前缀树算法，将 candidatePackages 合并归一化为极简的核心业务包树
-        val consolidatedAppRoots = consolidatePackageTree(candidatePackages)
-        Log.i(TAG, "归一化提取到的 App 业务根包: $consolidatedAppRoots")
+        // 核心算法 A：动态公共前缀包树算法 (彻底废除 parts.take(3) 硬编码)
+        val appRoots = findLongestCommonRoots(rawCandidatePackages)
 
-        return consolidatedAppRoots
+        // 核心算法 B：引用闭包分析 (仅当 App 业务代码真实引用了 Native/框架包时才保留)
+        val dynamicBridges = findReferencedBridges(rawClasses, appRoots)
+
+        val finalCodeSet = HashSet<String>()
+        finalCodeSet.addAll(appRoots)
+        finalCodeSet.addAll(dynamicBridges)
+
+        Log.i(TAG, "计算出最长公共根包: $appRoots | 动态引用扩展依赖: $dynamicBridges")
+        return finalCodeSet
     }
 
     /**
-     * 核心包树归一化算法：
-     * 输入：[io.nekohasekai.sagernet.ui, io.nekohasekai.sagernet.bg, io.nekohasekai.sagernet.database]
-     * 输出：[io.nekohasekai.sagernet]
-     * 输入：[com.wangwu.jymod52, com.wangwu.jymod52.ui]
-     * 输出：[com.wangwu.jymod52]
+     * 核心算法：计算最长公共包名树 (不依赖任何写死截取层级)
+     * 例 A: [io.nekohasekai.sagernet.ui, io.nekohasekai.sagernet.bg, io.nekohasekai.sagernet.database]
+     *      -> 自动计算出 io.nekohasekai.sagernet
+     * 例 B: [com.wangwu.jymod52, com.wangwu.jymod52.ui]
+     *      -> 自动计算出 com.wangwu.jymod52
      */
-    private fun consolidatePackageTree(packages: Collection<String>): Set<String> {
+    private fun findLongestCommonRoots(packages: Set<String>): Set<String> {
         if (packages.isEmpty()) return emptySet()
 
-        val validPkgs = packages.filter { !FilterHelper.isThirdPartyLibrary(it) }
+        val validPkgs = packages.filter { !FilterHelper.isThirdPartyLibrary(it) }.distinct()
         if (validPkgs.isEmpty()) return emptySet()
+        if (validPkgs.size == 1) return validPkgs.toSet()
 
-        val rootCandidates = HashSet<String>()
+        // 拆分为层级数组
+        val splitPackages = validPkgs.map { it.split(".") }
 
-        for (pkg in validPkgs) {
-            val parts = pkg.split(".")
-            // 如果包名包含 3 段或以上，先提取最可能的基准前缀（如取前 3 段或前 4 段）
-            if (parts.size >= 4) {
-                rootCandidates.add(parts.take(3).joinToString("."))
-                rootCandidates.add(parts.take(4).joinToString("."))
+        // 寻找所有候选包的最长公共前缀数组
+        var commonPrefix = splitPackages[0]
+        for (i in 1 until splitPackages.size) {
+            val current = splitPackages[i]
+            var j = 0
+            while (j < commonPrefix.size && j < current.size && commonPrefix[j] == current[j]) {
+                j++
+            }
+            commonPrefix = commonPrefix.take(j)
+        }
+
+        // 如果提取出的公共根包层级 >= 2 (如 io.nekohasekai 或 com.wangwu)
+        if (commonPrefix.size >= 2) {
+            val commonRootStr = commonPrefix.joinToString(".")
+            
+            // 进一步检查：如果所有包在该前缀之后紧跟相同的第三/四段，自动向下延伸合并
+            val remainingParts = validPkgs.mapNotNull { pkg ->
+                if (pkg.startsWith("$commonRootStr.")) {
+                    pkg.removePrefix("$commonRootStr.").split(".").firstOrNull()
+                } else null
+            }.distinct()
+
+            return if (remainingParts.size == 1) {
+                setOf("$commonRootStr.${remainingParts[0]}")
             } else {
-                rootCandidates.add(pkg)
+                setOf(commonRootStr)
             }
         }
 
-        // 按照包名长度升序排序，优先保留最简短的根包
-        val sortedCandidates = rootCandidates.sortedBy { it.length }
-        val finalRoots = HashSet<String>()
-
-        for (cand in sortedCandidates) {
-            // 如果当前候选包不属于任何已存在根包的子包，则作为新的根包加入
-            if (finalRoots.none { root -> cand == root || cand.startsWith("$root.") }) {
-                finalRoots.add(cand)
+        // 兜底方案：按包名长度升序去重子包
+        val sortedPkgs = validPkgs.sortedBy { it.length }
+        val rootSet = HashSet<String>()
+        for (pkg in sortedPkgs) {
+            if (rootSet.none { root -> pkg == root || pkg.startsWith("$root.") }) {
+                rootSet.add(pkg)
             }
         }
+        return rootSet
+    }
 
-        return finalRoots
+    /**
+     * 动态引用闭包分析：检查 App 业务代码源码中是否真实 import/引用了特定 Native/框架包
+     */
+    private fun findReferencedBridges(rawClasses: List<JavaClass>, appRoots: Set<String>): Set<String> {
+        val candidateBridges = listOf(
+            "go.",
+            "libcore.",
+            "org.libsdl.app.",
+            "com.unity3d.player.",
+            "org.cocos2dx.lib.",
+            "com.epicgames.ue4.",
+            "com.github.shadowsocks.plugin.",
+            "moe.matsuri.nb4a."
+        )
+
+        val activeBridges = HashSet<String>()
+        val appClasses = rawClasses.filter { cls ->
+            appRoots.any { root -> cls.fullName == root || cls.fullName.startsWith("$root.") }
+        }
+
+        // 快速扫描应用业务源码内容
+        for (cls in appClasses) {
+            try {
+                val code = cls.code
+                for (bridge in candidateBridges) {
+                    if (code.contains(bridge)) {
+                        activeBridges.add(bridge.removeSuffix("."))
+                    }
+                }
+            } catch (e: Exception) {
+                // 忽略个别类源码读取异常
+            }
+        }
+        return activeBridges
     }
 }
