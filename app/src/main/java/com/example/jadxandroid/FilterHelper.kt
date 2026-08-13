@@ -2,16 +2,20 @@ package com.example.jadxandroid
 
 object FilterHelper {
 
-    // 1. 知名游戏引擎与关键框架白名单 (即使 APP_ONLY 模式也必须保留，防止继承链断裂)
-    private val GAME_FRAMEWORK_WHITELIST = listOf(
-        "org.libsdl.app.",
-        "com.unity3d.player.",
-        "org.cocos2dx.lib.",
-        "com.epicgames.ue4.",
-        "com.godot.game."
+    // 1. 关键框架、游戏引擎及 Native/Go 桥接层白名单 (必须保留，否则 Native 调用链会挂)
+    private val NATIVE_FRAMEWORK_WHITELIST = listOf(
+        "go.",                             // Go 语言移动端绑定 (Gomobile)
+        "libcore.",                        // SagerNet/V2Ray 内核 Java 桥接层
+        "org.libsdl.app.",                 // SDL2 游戏引擎
+        "com.unity3d.player.",             // Unity 引擎
+        "org.cocos2dx.lib.",               // Cocos2d 引擎
+        "com.epicgames.ue4.",              // 虚幻引擎
+        "com.godot.game.",                 // Godot 引擎
+        "com.github.shadowsocks.plugin.",  // 常用插件层
+        "moe.matsuri.nb4a."                // 衍生代理模块
     )
 
-    // 2. 精准第三方库黑名单 (避免粗暴的前缀误杀)
+    // 2. 精准第三方黑名单
     private val THIRD_PARTY_BLACKLIST = listOf(
         "android.",
         "androidx.",
@@ -34,10 +38,6 @@ object FilterHelper {
         "com.tencent.mm.opensdk."
     )
 
-    /**
-     * 判断是否为 R 资源类/内部类 (如 R$drawable, R$string)
-     * 这些纯属资源 ID 映射，反编译代码分析时属于强噪音，需要过滤
-     */
     fun isResourceClass(className: String): Boolean {
         return className.contains("\$R\$") || 
                className.endsWith("\$R") || 
@@ -45,29 +45,22 @@ object FilterHelper {
                className.endsWith(".R")
     }
 
-    /**
-     * 判断是否属于游戏引擎/关键框架的保留类
-     */
-    fun isGameFrameworkClass(className: String): Boolean {
-        return GAME_FRAMEWORK_WHITELIST.any { className.startsWith(it) }
+    fun isNativeFrameworkClass(className: String): Boolean {
+        return NATIVE_FRAMEWORK_WHITELIST.any { className.startsWith(it) }
     }
 
-    /**
-     * 判断是否为第三方库
-     */
     fun isThirdPartyLibrary(className: String): Boolean {
         return THIRD_PARTY_BLACKLIST.any { className.startsWith(it) }
     }
 
     /**
-     * 核心统一过滤决策函数
+     * 核心统一过滤决策函数，支持接收 AppCodeSet 集合匹配
      */
     fun shouldKeepClass(
         className: String,
         filterMode: FilterMode,
-        appPackageName: String?
+        appCodeSet: Set<String>
     ): Boolean {
-        // 在非 ALL 模式下，永远过滤 R 资源无用噪音类
         if (filterMode != FilterMode.ALL && isResourceClass(className)) {
             return false
         }
@@ -80,13 +73,15 @@ object FilterHelper {
             }
 
             FilterMode.APP_ONLY -> {
-                // 1. 优先保留游戏引擎/关键框架基类 (如 SDLActivity)
-                if (isGameFrameworkClass(className)) {
+                // 1. 保留 Native/Go 桥接层及框架基类
+                if (isNativeFrameworkClass(className)) {
                     return true
                 }
-                // 2. 匹配应用主包
-                if (!appPackageName.isNullOrEmpty()) {
-                    className == appPackageName || className.startsWith("$appPackageName.")
+                // 2. 匹配业务代码包集合中的任意一个根包
+                if (appCodeSet.isNotEmpty()) {
+                    appCodeSet.any { rootPkg ->
+                        className == rootPkg || className.startsWith("$rootPkg.")
+                    }
                 } else {
                     !isThirdPartyLibrary(className)
                 }
