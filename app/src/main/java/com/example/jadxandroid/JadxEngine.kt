@@ -20,55 +20,9 @@ class JadxEngine(
 
     override fun getName(): String = "JADX"
 
-    private fun getPackageName(fullName: String): String {
-        return if (fullName.contains(".")) fullName.substringBeforeLast(".") else ""
-    }
-
-    /**
-     * 获取应用主包名 (双重保险机制)：
-     * 1. 优先调用 Android 系统原生 API 解析 APK Manifest (100% 准确)
-     * 2. 若为 DEX/JAR/ZIP 等无 Manifest 文件，退化为类频次统计推断
-     */
-    private fun getAppPackageName(file: File, classes: List<JavaClass>): String? {
-        // 优先级 1：针对 APK，直接调用 Android 原生 API 获取真实 Manifest 包名
-        try {
-            val archiveInfo = context.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
-            if (archiveInfo != null && !archiveInfo.packageName.isNullOrEmpty()) {
-                Log.d(TAG, "从 Android 原生 Manifest 成功获取包名: ${archiveInfo.packageName}")
-                return archiveInfo.packageName
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "无法通过原生 API 获取 Manifest: ${e.localizedMessage}")
-        }
-
-        // 优先级 2：保底方案 - 统计频次推断 (适用于 DEX/JAR/ZIP)
-        val nonThirdPartyClasses = classes.filter { 
-            !FilterHelper.isResourceClass(it.fullName) && !FilterHelper.isThirdPartyLibrary(it.fullName) 
-        }
-        if (nonThirdPartyClasses.isEmpty()) return null
-
-        val packageCounts = HashMap<String, Int>()
-        for (cls in nonThirdPartyClasses) {
-            val pkg = getPackageName(cls.fullName)
-            if (pkg.isNotEmpty()) {
-                packageCounts[pkg] = (packageCounts[pkg] ?: 0) + 1
-            }
-        }
-        if (packageCounts.isEmpty()) return null
-
-        val mostFrequentPkg = packageCounts.maxByOrNull { it.value }?.key ?: return null
-        val parts = mostFrequentPkg.split(".")
-
-        return if (parts.size >= 3) {
-            parts.take(3).joinToString(".")
-        } else {
-            mostFrequentPkg
-        }
-    }
-
-    private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appPackageName: String?): Boolean {
-        // 核心修改：不再全局剥离 isInner！保留如 JYmodActivity$1 等业务逻辑内部类，仅由 FilterHelper 剔除 R$ 资源类
-        return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appPackageName)
+    private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appCodeSet: Set<String>): Boolean {
+        if (cls.isInner) return false
+        return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appCodeSet)
     }
 
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
@@ -83,9 +37,9 @@ class JadxEngine(
                 decompiler.load()
 
                 val rawClasses = decompiler.classes
-                val appPackageName = getAppPackageName(file, rawClasses)
+                val appCodeSet = AppPackageDetector.detectAppCodeSet(context, file, rawClasses)
 
-                val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appPackageName) }
+                val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appCodeSet) }
 
                 if (filteredClasses.isEmpty()) {
                     return@withContext "未在文件中找到匹配当前过滤模式 [${filterMode.displayName}] 的类。"
@@ -93,8 +47,8 @@ class JadxEngine(
 
                 sb.append("// ==========================================\n")
                 sb.append("//  JADX 引擎反编译预览\n")
-                if (!appPackageName.isNullOrEmpty()) {
-                    sb.append("//  💡 识别应用主包名: $appPackageName\n")
+                if (appCodeSet.isNotEmpty()) {
+                    sb.append("//  💡 识别应用业务根包: $appCodeSet\n")
                 }
                 sb.append("//  当前过滤模式: ${filterMode.displayName}\n")
                 sb.append("//  原始类总数: ${rawClasses.size} | 过滤后保留: ${filteredClasses.size}\n")
@@ -136,17 +90,17 @@ class JadxEngine(
                 }
 
                 var totalClassesCount = 0
-                var detectedPackageName: String? = null
+                var appCodeSet: Set<String> = emptySet()
                 val classesToDecompile = ArrayList<String>()
 
                 createFreshDecompiler().use { decompiler ->
                     decompiler.load()
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
-                    detectedPackageName = getAppPackageName(file, rawClasses)
+                    appCodeSet = AppPackageDetector.detectAppCodeSet(context, file, rawClasses)
 
                     for (cls in rawClasses) {
-                        if (shouldKeepJavaClass(cls, filterMode, detectedPackageName)) {
+                        if (shouldKeepJavaClass(cls, filterMode, appCodeSet)) {
                             classesToDecompile.add(cls.fullName)
                         }
                     }
@@ -155,8 +109,8 @@ class JadxEngine(
                 writer.write("// ==========================================\n")
                 writer.write("//  JADX 手机版 (JADX 引擎) 自动生成\n")
                 writer.write("//  源文件: $currentFileName\n")
-                if (!detectedPackageName.isNullOrEmpty()) {
-                    writer.write("//  应用主包名: $detectedPackageName\n")
+                if (appCodeSet.isNotEmpty()) {
+                    writer.write("//  识别应用业务根包: $appCodeSet\n")
                 }
                 writer.write("//  过滤模式: ${filterMode.displayName}\n")
                 writer.write("//  原始类总数: $totalClassesCount\n")
