@@ -20,8 +20,14 @@ class JadxEngine(
 
     override fun getName(): String = "JADX"
 
-    private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, appCodeSet: Set<String>): Boolean {
-        return FilterHelper.shouldKeepClass(cls.fullName, filterMode, appCodeSet)
+    private fun shouldKeepJavaClass(cls: JavaClass, filterMode: FilterMode, analysisResult: AppCodeAnalysisResult): Boolean {
+        // 在 APP_ONLY 模式下，仅导出纯净的 App 自有代码集合
+        val allowedSet = if (filterMode == FilterMode.APP_ONLY) {
+            analysisResult.getAppOwnedPackages()
+        } else {
+            analysisResult.getAllAllowedPackages()
+        }
+        return FilterHelper.shouldKeepClass(cls.fullName, filterMode, allowedSet)
     }
 
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
@@ -37,9 +43,8 @@ class JadxEngine(
 
                 val rawClasses = decompiler.classes
                 val analysisResult = AppPackageDetector.analyzeJadx(context, file, rawClasses)
-                val appCodeSet = analysisResult.getAllAllowedPackages()
 
-                val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, appCodeSet) }
+                val filteredClasses = rawClasses.filter { shouldKeepJavaClass(it, filterMode, analysisResult) }
 
                 if (filteredClasses.isEmpty()) {
                     return@withContext "未在文件中找到匹配当前过滤模式 [${filterMode.displayName}] 的类。"
@@ -100,10 +105,9 @@ class JadxEngine(
                     val rawClasses = decompiler.classes
                     totalClassesCount = rawClasses.size
                     analysisResult = AppPackageDetector.analyzeJadx(context, file, rawClasses)
-                    val appCodeSet = analysisResult.getAllAllowedPackages()
 
                     for (cls in rawClasses) {
-                        if (shouldKeepJavaClass(cls, filterMode, appCodeSet)) {
+                        if (shouldKeepJavaClass(cls, filterMode, analysisResult)) {
                             classesToDecompile.add(cls.fullName)
                         }
                     }
