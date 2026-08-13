@@ -2,20 +2,7 @@ package com.example.jadxandroid
 
 object FilterHelper {
 
-    // 1. 关键框架、游戏引擎及 Native/Go 桥接层白名单 (必须保留，否则 Native 调用链会挂)
-    private val NATIVE_FRAMEWORK_WHITELIST = listOf(
-        "go.",                             // Go 语言移动端绑定 (Gomobile)
-        "libcore.",                        // SagerNet/V2Ray 内核 Java 桥接层
-        "org.libsdl.app.",                 // SDL2 游戏引擎
-        "com.unity3d.player.",             // Unity 引擎
-        "org.cocos2dx.lib.",               // Cocos2d 引擎
-        "com.epicgames.ue4.",              // 虚幻引擎
-        "com.godot.game.",                 // Godot 引擎
-        "com.github.shadowsocks.plugin.",  // 常用插件层
-        "moe.matsuri.nb4a."                // 衍生代理模块
-    )
-
-    // 2. 精准第三方黑名单
+    // 精准第三方黑名单
     private val THIRD_PARTY_BLACKLIST = listOf(
         "android.",
         "androidx.",
@@ -45,22 +32,19 @@ object FilterHelper {
                className.endsWith(".R")
     }
 
-    fun isNativeFrameworkClass(className: String): Boolean {
-        return NATIVE_FRAMEWORK_WHITELIST.any { className.startsWith(it) }
-    }
-
     fun isThirdPartyLibrary(className: String): Boolean {
         return THIRD_PARTY_BLACKLIST.any { className.startsWith(it) }
     }
 
     /**
-     * 核心统一过滤决策函数，支持接收 AppCodeSet 集合匹配
+     * 核心统一过滤决策函数
      */
     fun shouldKeepClass(
         className: String,
         filterMode: FilterMode,
         appCodeSet: Set<String>
     ): Boolean {
+        // 在非 ALL 模式下，过滤 R 资源干扰类
         if (filterMode != FilterMode.ALL && isResourceClass(className)) {
             return false
         }
@@ -73,12 +57,8 @@ object FilterHelper {
             }
 
             FilterMode.APP_ONLY -> {
-                // 1. 保留 Native/Go 桥接层及框架基类
-                if (isNativeFrameworkClass(className)) {
-                    return true
-                }
-                // 2. 匹配业务代码包集合中的任意一个根包
                 if (appCodeSet.isNotEmpty()) {
+                    // 匹配应用业务代码根包以及动态引用的框架依赖包
                     appCodeSet.any { rootPkg ->
                         className == rootPkg || className.startsWith("$rootPkg.")
                     }
