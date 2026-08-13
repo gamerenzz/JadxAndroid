@@ -47,6 +47,15 @@ class CfrEngine(
         }
     }
 
+    private fun shouldKeepCfrClass(className: String, filterMode: FilterMode, analysisResult: AppCodeAnalysisResult): Boolean {
+        val allowedSet = if (filterMode == FilterMode.APP_ONLY) {
+            analysisResult.getAppOwnedPackages()
+        } else {
+            analysisResult.getAllAllowedPackages()
+        }
+        return FilterHelper.shouldKeepClass(className, filterMode, allowedSet)
+    }
+
     override suspend fun decompilePreview(file: File, filterMode: FilterMode): String = withContext(Dispatchers.IO) {
         if (isApkOrDex(file)) {
             return@withContext "CFR 引擎仅支持标准 Java .class 或 .jar/.zip 文件。\n安卓 .apk/.dex 请切换至 JADX 引擎解析。"
@@ -67,13 +76,12 @@ class CfrEngine(
                         .toList()
 
                     val analysisResult = AppPackageDetector.analyzeCfr(allEntryNames)
-                    val appCodeSet = analysisResult.getAllAllowedPackages()
 
                     val entries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".class") }
                         .filter { entry ->
                             val className = entry.name.replace('/', '.').substringBeforeLast(".class")
-                            FilterHelper.shouldKeepClass(className, filterMode, appCodeSet)
+                            shouldKeepCfrClass(className, filterMode, analysisResult)
                         }
                         .toList()
 
@@ -103,6 +111,7 @@ class CfrEngine(
                             }
                         }
 
+                        // 传递父 JAR/ZIP 作为 ClassPath，保证类型推导完整
                         val code = decompileSingleClass(tempClassFile, file)
                         tempClassFile.delete()
 
@@ -142,13 +151,12 @@ class CfrEngine(
                             .toList()
 
                         val analysisResult = AppPackageDetector.analyzeCfr(allEntryNames)
-                        val appCodeSet = analysisResult.getAllAllowedPackages()
 
                         val entries = zip.entries().asSequence()
                             .filter { !it.isDirectory && it.name.endsWith(".class") }
                             .filter { entry ->
                                 val className = entry.name.replace('/', '.').substringBeforeLast(".class")
-                                FilterHelper.shouldKeepClass(className, filterMode, appCodeSet)
+                                shouldKeepCfrClass(className, filterMode, analysisResult)
                             }
                             .toList()
 
@@ -291,6 +299,23 @@ class CfrEngine(
         val options = HashMap<String, String>()
         options["showversion"] = "false"
         
+        // P0-3 修复：将父类 JAR/ZIP 文件挂载为 CFR 的 ClassPath，保障反编译类型完整性
+        if (classpathFile != null && classpathFile.exists()) {
+            options["extraclasspath"] = classpathFile.absolutePath
+        }
+
+        val localLibs = libsDir?.listFiles { file -> 
+            file.isFile && file.name.endsWith(".jar", ignoreCase = true) 
+        }
+        if (!localLibs.isNullOrEmpty()) {
+            val cpBuilder = StringBuilder()
+            if (options.containsKey("extraclasspath")) {
+                cpBuilder.append(options["extraclasspath"]).append(":")
+            }
+            cpBuilder.append(localLibs.joinToString(":") { it.absolutePath })
+            options["extraclasspath"] = cpBuilder.toString()
+        }
+
         val driver = CfrDriver.Builder()
             .withOptions(options)
             .withOutputSink(sinkFactory)
