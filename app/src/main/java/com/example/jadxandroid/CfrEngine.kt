@@ -102,22 +102,22 @@ class CfrEngine(
                         val className = entry.name.replace('/', '.').substringBeforeLast(".class")
                         val category = analysisResult.classify(className)
 
-                        val tempClassFile = File(context.cacheDir, "TempDecompile.class")
-                        if (tempClassFile.exists()) tempClassFile.delete()
-
-                        zip.getInputStream(entry).use { input ->
-                            FileOutputStream(tempClassFile).use { output ->
-                                input.copyTo(output)
+                        // 动态生成防并发覆盖的唯一临时文件
+                        val tempClassFile = File.createTempFile("cfr_preview_", ".class", context.cacheDir)
+                        try {
+                            zip.getInputStream(entry).use { input ->
+                                FileOutputStream(tempClassFile).use { output ->
+                                    input.copyTo(output)
+                                }
                             }
+
+                            val code = decompileSingleClass(tempClassFile, file)
+                            sb.append("// [预览 ${i + 1}/$displayLimit] [${category.code}] 类名: $className\n")
+                            sb.append(code)
+                            sb.append("\n\n// ==========================================\n\n")
+                        } finally {
+                            if (tempClassFile.exists()) tempClassFile.delete()
                         }
-
-                        // 传递父 JAR/ZIP 作为 ClassPath，保证类型推导完整
-                        val code = decompileSingleClass(tempClassFile, file)
-                        tempClassFile.delete()
-
-                        sb.append("// [预览 ${i + 1}/$displayLimit] [${category.code}] 类名: $className\n")
-                        sb.append(code)
-                        sb.append("\n\n// ==========================================\n\n")
                     }
                 }
             }
@@ -176,6 +176,7 @@ class CfrEngine(
                         writer.write("//  JADX 手机版 (CFR 引擎) 结构化代码提取报告\n")
                         writer.write("//  源文件: $currentFileName\n")
                         writer.write("//  过滤模式: ${filterMode.displayName}\n")
+                        writer.write("//  注: 统计口径为当前过滤模式 (${filterMode.displayName}) 下实际导出的 Class 数量与分布\n")
                         writer.write("//  \n")
                         writer.write("//  📊 导出代码包分布分类统计:\n")
 
@@ -228,10 +229,8 @@ class CfrEngine(
 
                             writer.write("// [类 ${index + 1}/$total] [分类: ${category.code}] 类名: $className\n")
 
+                            val tempClassFile = File.createTempFile("cfr_export_", ".class", context.cacheDir)
                             try {
-                                val tempClassFile = File(context.cacheDir, "TempDecompile.class")
-                                if (tempClassFile.exists()) tempClassFile.delete()
-
                                 zip.getInputStream(entry).use { input ->
                                     FileOutputStream(tempClassFile).use { output ->
                                         input.copyTo(output)
@@ -239,11 +238,11 @@ class CfrEngine(
                                 }
 
                                 val code = decompileSingleClass(tempClassFile, file)
-                                tempClassFile.delete()
-
                                 writer.write(code)
                             } catch (e: Throwable) {
                                 writer.write("// !!! 警告：该类反编译失败 !!!\n")
+                            } finally {
+                                if (tempClassFile.exists()) tempClassFile.delete()
                             }
 
                             writer.write("\n\n// ------------------------------------------\n\n")
@@ -299,7 +298,8 @@ class CfrEngine(
         val options = HashMap<String, String>()
         options["showversion"] = "false"
         
-        // P0-3 修复：将父类 JAR/ZIP 文件挂载为 CFR 的 ClassPath，保障反编译类型完整性
+        // 动态使用系统 pathSeparator (: 或 ;) 挂载 ClassPath，保障环境兼容性
+        val sep = File.pathSeparator
         if (classpathFile != null && classpathFile.exists()) {
             options["extraclasspath"] = classpathFile.absolutePath
         }
@@ -310,9 +310,9 @@ class CfrEngine(
         if (!localLibs.isNullOrEmpty()) {
             val cpBuilder = StringBuilder()
             if (options.containsKey("extraclasspath")) {
-                cpBuilder.append(options["extraclasspath"]).append(":")
+                cpBuilder.append(options["extraclasspath"]).append(sep)
             }
-            cpBuilder.append(localLibs.joinToString(":") { it.absolutePath })
+            cpBuilder.append(localLibs.joinToString(sep) { it.absolutePath })
             options["extraclasspath"] = cpBuilder.toString()
         }
 
